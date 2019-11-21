@@ -7,16 +7,50 @@ import (
 	"encoding/binary"
 	"encoding/hex"
 	"encoding/json"
+	"strconv"
+	"strings"
 
 	"fmt"
 
 	"github.com/pkg/errors"
 	"github.com/prometheus/common/model"
+	"github.com/prometheus/prometheus/pkg/labels"
 )
 
-func metricSeriesID(m model.Metric) string {
-	h := sha256.Sum256([]byte(m.String()))
-	return string(encodeBase64Bytes(h[:]))
+// Backwards-compatible with model.Metric.String()
+func labelsString(ls labels.Labels) string {
+	metricName := ls.Get(labels.MetricName)
+	if metricName != "" && len(ls) == 1 {
+		return metricName
+	}
+	var b strings.Builder
+	b.Grow(1000)
+
+	b.WriteString(metricName)
+	b.WriteByte('{')
+	i := 0
+	for _, l := range ls {
+		if l.Name == labels.MetricName {
+			continue
+		}
+		if i > 0 {
+			b.WriteByte(',')
+			b.WriteByte(' ')
+		}
+		b.WriteString(l.Name)
+		b.WriteByte('=')
+		var buf [1000]byte
+		b.Write(strconv.AppendQuote(buf[:0], l.Value))
+		i++
+	}
+	b.WriteByte('}')
+
+	return b.String()
+}
+
+func labelsSeriesID(ls labels.Labels) []byte {
+	h := sha256.Sum256([]byte(labelsString(ls)))
+	return encodeBase64Bytes(h[:])
 }
 
 func sha256bytes(s string) []byte {
@@ -59,7 +93,7 @@ func encodeBase64Bytes(bytes []byte) []byte {
 	return encoded
 }
 
-func encodeBase64Value(value model.LabelValue) []byte {
+func encodeBase64Value(value string) []byte {
 	encodedLen := base64.RawStdEncoding.EncodedLen(len(value))
 	encoded := make([]byte, encodedLen, encodedLen)
 	base64.RawStdEncoding.Encode(encoded, []byte(value))
@@ -105,7 +139,7 @@ func parseMetricNameRangeValue(rangeValue []byte, value []byte) (model.LabelValu
 		return model.LabelValue(value), nil
 
 	default:
-		return "", fmt.Errorf("unrecognised metricNameRangeKey version: '%v'", string(components[3]))
+		return "", fmt.Errorf("unrecognised metricNameRangeKey version: %q", string(components[3]))
 	}
 }
 
@@ -126,7 +160,7 @@ func parseSeriesRangeValue(rangeValue []byte, value []byte) (model.Metric, error
 		return series, nil
 
 	default:
-		return nil, fmt.Errorf("unrecognised seriesRangeKey version: '%v'", string(components[3]))
+		return nil, fmt.Errorf("unrecognised seriesRangeKey version: %q", string(components[3]))
 	}
 }
 
@@ -153,6 +187,9 @@ func parseChunkTimeRangeValue(rangeValue []byte, value []byte) (
 
 	// v3 schema had four components - label name, label value, chunk ID and version.
 	// "version" is 1 and label value is base64 encoded.
+	// (older code wrote "version" as 1, not '1')
+	case bytes.Equal(components[3], chunkTimeRangeKeyV1a):
+		fallthrough
 	case bytes.Equal(components[3], chunkTimeRangeKeyV1):
 		chunkID = string(components[2])
 		labelValue, err = decodeBase64Value(components[1])
@@ -195,7 +232,7 @@ func parseChunkTimeRangeValue(rangeValue []byte, value []byte) (
 		return
 
 	default:
-		err = fmt.Errorf("unrecognised chunkTimeRangeKey version: '%v'", string(components[3]))
+		err = fmt.Errorf("unrecognised chunkTimeRangeKey version: %q", string(components[3]))
 		return
 	}
 }

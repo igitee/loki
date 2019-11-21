@@ -21,7 +21,7 @@ func (f *fixture) Name() string {
 }
 
 func (f *fixture) Clients() (
-	indexClient chunk.IndexClient, chunkClient chunk.ObjectClient, tableClient chunk.TableClient,
+	indexClient chunk.IndexClient, objectClient chunk.ObjectClient, tableClient chunk.TableClient,
 	schemaConfig chunk.SchemaConfig, err error,
 ) {
 	f.dirname, err = ioutil.TempDir(os.TempDir(), "boltdb")
@@ -36,14 +36,14 @@ func (f *fixture) Clients() (
 		return
 	}
 
-	chunkClient, err = NewFSObjectClient(FSConfig{
+	objectClient, err = NewFSObjectClient(FSConfig{
 		Directory: f.dirname,
 	})
 	if err != nil {
 		return
 	}
 
-	tableClient, err = NewTableClient()
+	tableClient, err = NewTableClient(f.dirname)
 	if err != nil {
 		return
 	}
@@ -51,7 +51,7 @@ func (f *fixture) Clients() (
 	schemaConfig = chunk.SchemaConfig{
 		Configs: []chunk.PeriodConfig{{
 			IndexType: "boltdb",
-			From:      model.Now(),
+			From:      chunk.DayTime{Time: model.Now()},
 			ChunkTables: chunk.PeriodicTableConfig{
 				Prefix: "chunks",
 				Period: 10 * time.Minute,

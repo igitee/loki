@@ -16,15 +16,48 @@ import (
 
 const chunkDecodeParallelism = 16
 
-func filterChunksByTime(from, through model.Time, chunks []Chunk) ([]Chunk, []string) {
+func filterChunksByTime(from, through model.Time, chunks []Chunk) []Chunk {
 	filtered := make([]Chunk, 0, len(chunks))
-	keys := make([]string, 0, len(chunks))
 	for _, chunk := range chunks {
 		if chunk.Through < from || through < chunk.From {
 			continue
 		}
 		filtered = append(filtered, chunk)
+	}
+	return filtered
+}
+
+func keysFromChunks(chunks []Chunk) []string {
+	keys := make([]string, 0, len(chunks))
+	for _, chk := range chunks {
+		keys = append(keys, chk.ExternalKey())
+	}
+
+	return keys
+}
+
+func labelNamesFromChunks(chunks []Chunk) []string {
+	var result UniqueStrings
+	for _, c := range chunks {
+		for _, l := range c.Metric {
+			result.Add(string(l.Name))
+		}
+	}
+	return result.Strings()
+}
+
+func filterChunksByUniqueFingerprint(chunks []Chunk) ([]Chunk, []string) {
+	filtered := make([]Chunk, 0, len(chunks))
+	keys := make([]string, 0, len(chunks))
+	uniqueFp := map[model.Fingerprint]struct{}{}
+
+	for _, chunk := range chunks {
+		if _, ok := uniqueFp[chunk.Fingerprint]; ok {
+			continue
+		}
+		filtered = append(filtered, chunk)
 		keys = append(keys, chunk.ExternalKey())
+		uniqueFp[chunk.Fingerprint] = struct{}{}
 	}
 	return filtered, keys
 }
@@ -34,7 +67,7 @@ func filterChunksByMatchers(chunks []Chunk, filters []*labels.Matcher) []Chunk {
 outer:
 	for _, chunk := range chunks {
 		for _, filter := range filters {
-			if !filter.Matches(string(chunk.Metric[model.LabelName(filter.Name)])) {
+			if !filter.Matches(chunk.Metric.Get(filter.Name)) {
 				continue outer
 			}
 		}
@@ -47,8 +80,9 @@ outer:
 // and writing back any misses to the cache.  Also responsible for decoding
 // chunks from the cache, in parallel.
 type Fetcher struct {
-	storage ObjectClient
-	cache   cache.Cache
+	storage    ObjectClient
+	cache      cache.Cache
+	cacheStubs bool
 
 	wait           sync.WaitGroup
 	decodeRequests chan decodeRequest
@@ -65,7 +99,8 @@ type decodeResponse struct {
 }
 
 // NewChunkFetcher makes a new ChunkFetcher.
-func NewChunkFetcher(cfg cache.Config, storage ObjectClient) (*Fetcher, error) {
+func NewChunkFetcher(cfg cache.Config, cacheStubs bool, storage ObjectClient) (*Fetcher, error) {
+	cfg.Prefix = "chunks"
 	cache, err := cache.New(cfg)
 	if err != nil {
 		return nil, err
@@ -74,6 +109,7 @@ func NewChunkFetcher(cfg cache.Config, storage ObjectClient) (*Fetcher, error) {
 	c := &Fetcher{
 		storage:        storage,
 		cache:          cache,
+		cacheStubs:     cacheStubs,
 		decodeRequests: make(chan decodeRequest),
 	}
 
@@ -107,7 +143,8 @@ func (c *Fetcher) worker() {
 	}
 }
 
-// FetchChunks fetchers a set of chunks from cache and store.
+// FetchChunks fetches a set of chunks from cache and store. Note that the keys passed in must be
+// lexicographically sorted, while the returned chunks are not in the same order as the passed in chunks.
 func (c *Fetcher) FetchChunks(ctx context.Context, chunks []Chunk, keys []string) ([]Chunk, error) {
 	log, ctx := spanlogger.New(ctx, "ChunkStore.fetchChunks")
 	defer log.Span.Finish()
@@ -142,10 +179,14 @@ func (c *Fetcher) writeBackCache(ctx context.Context, chunks []Chunk) error {
 	keys := make([]string, 0, len(chunks))
 	bufs := make([][]byte, 0, len(chunks))
 	for i := range chunks {
-		encoded, err := chunks[i].Encode()
-		// TODO don't fail, just log and conitnue?
-		if err != nil {
-			return err
+		var encoded []byte
+		var err error
+		if !c.cacheStubs {
+			encoded, err = chunks[i].Encoded()
+			// TODO don't fail, just log and conitnue?
+			if err != nil {
+				return err
+			}
 		}
 
 		keys = append(keys, chunks[i].ExternalKey())

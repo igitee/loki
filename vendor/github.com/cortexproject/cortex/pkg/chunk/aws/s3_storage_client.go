@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"fmt"
+	"hash/fnv"
 	"io/ioutil"
 	"strings"
 
@@ -20,21 +21,21 @@ import (
 )
 
 var (
-	s3RequestDuration = prometheus.NewHistogramVec(prometheus.HistogramOpts{
+	s3RequestDuration = instrument.NewHistogramCollector(prometheus.NewHistogramVec(prometheus.HistogramOpts{
 		Namespace: "cortex",
 		Name:      "s3_request_duration_seconds",
 		Help:      "Time spent doing S3 requests.",
 		Buckets:   []float64{.025, .05, .1, .25, .5, 1, 2},
-	}, []string{"operation", "status_code"})
+	}, []string{"operation", "status_code"}))
 )
 
 func init() {
-	prometheus.MustRegister(s3RequestDuration)
+	s3RequestDuration.Register()
 }
 
 type s3ObjectClient struct {
-	bucketName string
-	S3         s3iface.S3API
+	bucketNames []string
+	S3          s3iface.S3API
 }
 
 // NewS3ObjectClient makes a new S3-backed ObjectClient.
@@ -47,12 +48,17 @@ func NewS3ObjectClient(cfg StorageConfig, schemaCfg chunk.SchemaConfig) (chunk.O
 		return nil, err
 	}
 
+	s3Config = s3Config.WithS3ForcePathStyle(cfg.S3ForcePathStyle) // support for Path Style S3 url if has the flag
+
 	s3Config = s3Config.WithMaxRetries(0) // We do our own retries, so we can monitor them
 	s3Client := s3.New(session.New(s3Config))
-	bucketName := strings.TrimPrefix(cfg.S3.URL.Path, "/")
+	bucketNames := []string{strings.TrimPrefix(cfg.S3.URL.Path, "/")}
+	if cfg.BucketNames != "" {
+		bucketNames = strings.Split(cfg.BucketNames, ",") // comma separated list of bucket names
+	}
 	client := s3ObjectClient{
-		S3:         s3Client,
-		bucketName: bucketName,
+		S3:          s3Client,
+		bucketNames: bucketNames,
 	}
 	return client, nil
 }
@@ -66,11 +72,16 @@ func (a s3ObjectClient) GetChunks(ctx context.Context, chunks []chunk.Chunk) ([]
 
 func (a s3ObjectClient) getChunk(ctx context.Context, decodeContext *chunk.DecodeContext, c chunk.Chunk) (chunk.Chunk, error) {
 	var resp *s3.GetObjectOutput
-	err := instrument.TimeRequestHistogram(ctx, "S3.GetObject", s3RequestDuration, func(ctx context.Context) error {
+
+	// Map the key into a bucket
+	key := c.ExternalKey()
+	bucket := a.bucketFromKey(key)
+
+	err := instrument.CollectedRequest(ctx, "S3.GetObject", s3RequestDuration, instrument.ErrorCode, func(ctx context.Context) error {
 		var err error
 		resp, err = a.S3.GetObjectWithContext(ctx, &s3.GetObjectInput{
-			Bucket: aws.String(a.bucketName),
-			Key:    aws.String(c.ExternalKey()),
+			Bucket: aws.String(bucket),
+			Key:    aws.String(key),
 		})
 		return err
 	})
@@ -95,8 +106,7 @@ func (a s3ObjectClient) PutChunks(ctx context.Context, chunks []chunk.Chunk) err
 	)
 
 	for i := range chunks {
-		// Encode the chunk first - checksum is calculated as a side effect.
-		buf, err := chunks[i].Encode()
+		buf, err := chunks[i].Encoded()
 		if err != nil {
 			return err
 		}
@@ -124,12 +134,25 @@ func (a s3ObjectClient) PutChunks(ctx context.Context, chunks []chunk.Chunk) err
 }
 
 func (a s3ObjectClient) putS3Chunk(ctx context.Context, key string, buf []byte) error {
-	return instrument.TimeRequestHistogram(ctx, "S3.PutObject", s3RequestDuration, func(ctx context.Context) error {
+	return instrument.CollectedRequest(ctx, "S3.PutObject", s3RequestDuration, instrument.ErrorCode, func(ctx context.Context) error {
 		_, err := a.S3.PutObjectWithContext(ctx, &s3.PutObjectInput{
 			Body:   bytes.NewReader(buf),
-			Bucket: aws.String(a.bucketName),
+			Bucket: aws.String(a.bucketFromKey(key)),
 			Key:    aws.String(key),
 		})
 		return err
 	})
+}
+
+// bucketFromKey maps a key to a bucket name
+func (a s3ObjectClient) bucketFromKey(key string) string {
+	if len(a.bucketNames) == 0 {
+		return ""
+	}
+
+	hasher := fnv.New32a()
+	hasher.Write([]byte(key))
+	hash := hasher.Sum32()
+
+	return a.bucketNames[hash%uint32(len(a.bucketNames))]
 }

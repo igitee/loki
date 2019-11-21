@@ -2,12 +2,14 @@ package aws
 
 import (
 	"context"
+	"strings"
 
 	"github.com/aws/aws-sdk-go/aws"
 	"github.com/aws/aws-sdk-go/aws/awserr"
 	"github.com/aws/aws-sdk-go/service/dynamodb"
 	"github.com/aws/aws-sdk-go/service/dynamodb/dynamodbiface"
 	"github.com/go-kit/kit/log/level"
+	"github.com/pkg/errors"
 	"golang.org/x/time/rate"
 
 	"github.com/cortexproject/cortex/pkg/chunk"
@@ -100,7 +102,7 @@ func (d callManager) backoffAndRetry(ctx context.Context, fn func(context.Contex
 func (d dynamoTableClient) ListTables(ctx context.Context) ([]string, error) {
 	table := []string{}
 	err := d.backoffAndRetry(ctx, func(ctx context.Context) error {
-		return instrument.TimeRequestHistogram(ctx, "DynamoDB.ListTablesPages", dynamoRequestDuration, func(ctx context.Context) error {
+		return instrument.CollectedRequest(ctx, "DynamoDB.ListTablesPages", dynamoRequestDuration, instrument.ErrorCode, func(ctx context.Context) error {
 			return d.DynamoDB.ListTablesPagesWithContext(ctx, &dynamodb.ListTablesInput{}, func(resp *dynamodb.ListTablesOutput, _ bool) bool {
 				for _, s := range resp.TableNames {
 					table = append(table, *s)
@@ -126,7 +128,7 @@ func chunkTagsToDynamoDB(ts chunk.Tags) []*dynamodb.Tag {
 func (d dynamoTableClient) CreateTable(ctx context.Context, desc chunk.TableDesc) error {
 	var tableARN *string
 	if err := d.backoffAndRetry(ctx, func(ctx context.Context) error {
-		return instrument.TimeRequestHistogram(ctx, "DynamoDB.CreateTable", dynamoRequestDuration, func(ctx context.Context) error {
+		return instrument.CollectedRequest(ctx, "DynamoDB.CreateTable", dynamoRequestDuration, instrument.ErrorCode, func(ctx context.Context) error {
 			input := &dynamodb.CreateTableInput{
 				TableName: aws.String(desc.Name),
 				AttributeDefinitions: []*dynamodb.AttributeDefinition{
@@ -149,11 +151,18 @@ func (d dynamoTableClient) CreateTable(ctx context.Context, desc chunk.TableDesc
 						KeyType:       aws.String(dynamodb.KeyTypeRange),
 					},
 				},
-				ProvisionedThroughput: &dynamodb.ProvisionedThroughput{
+			}
+
+			if desc.UseOnDemandIOMode {
+				input.BillingMode = aws.String(dynamodb.BillingModePayPerRequest)
+			} else {
+				input.BillingMode = aws.String(dynamodb.BillingModeProvisioned)
+				input.ProvisionedThroughput = &dynamodb.ProvisionedThroughput{
 					ReadCapacityUnits:  aws.Int64(desc.ProvisionedRead),
 					WriteCapacityUnits: aws.Int64(desc.ProvisionedWrite),
-				},
+				}
 			}
+
 			output, err := d.DynamoDB.CreateTableWithContext(ctx, input)
 			if err != nil {
 				return err
@@ -177,22 +186,43 @@ func (d dynamoTableClient) CreateTable(ctx context.Context, desc chunk.TableDesc
 	tags := chunkTagsToDynamoDB(desc.Tags)
 	if len(tags) > 0 {
 		return d.backoffAndRetry(ctx, func(ctx context.Context) error {
-			return instrument.TimeRequestHistogram(ctx, "DynamoDB.TagResource", dynamoRequestDuration, func(ctx context.Context) error {
+			return instrument.CollectedRequest(ctx, "DynamoDB.TagResource", dynamoRequestDuration, instrument.ErrorCode, func(ctx context.Context) error {
 				_, err := d.DynamoDB.TagResourceWithContext(ctx, &dynamodb.TagResourceInput{
 					ResourceArn: tableARN,
 					Tags:        tags,
 				})
-				return err
+				if relevantError(err) {
+					return err
+				}
+				return nil
 			})
 		})
 	}
 	return nil
 }
 
+func (d dynamoTableClient) DeleteTable(ctx context.Context, name string) error {
+	if err := d.backoffAndRetry(ctx, func(ctx context.Context) error {
+		return instrument.CollectedRequest(ctx, "DynamoDB.DeleteTable", dynamoRequestDuration, instrument.ErrorCode, func(ctx context.Context) error {
+			input := &dynamodb.DeleteTableInput{TableName: aws.String(name)}
+			_, err := d.DynamoDB.DeleteTableWithContext(ctx, input)
+			if err != nil {
+				return err
+			}
+
+			return nil
+		})
+	}); err != nil {
+		return err
+	}
+
+	return nil
+}
+
 func (d dynamoTableClient) DescribeTable(ctx context.Context, name string) (desc chunk.TableDesc, isActive bool, err error) {
 	var tableARN *string
 	err = d.backoffAndRetry(ctx, func(ctx context.Context) error {
-		return instrument.TimeRequestHistogram(ctx, "DynamoDB.DescribeTable", dynamoRequestDuration, func(ctx context.Context) error {
+		return instrument.CollectedRequest(ctx, "DynamoDB.DescribeTable", dynamoRequestDuration, instrument.ErrorCode, func(ctx context.Context) error {
 			out, err := d.DynamoDB.DescribeTableWithContext(ctx, &dynamodb.DescribeTableInput{
 				TableName: aws.String(name),
 			})
@@ -212,6 +242,9 @@ func (d dynamoTableClient) DescribeTable(ctx context.Context, name string) (desc
 				if out.Table.TableStatus != nil {
 					isActive = (*out.Table.TableStatus == dynamodb.TableStatusActive)
 				}
+				if out.Table.BillingModeSummary != nil {
+					desc.UseOnDemandIOMode = *out.Table.BillingModeSummary.BillingMode == dynamodb.BillingModePayPerRequest
+				}
 				tableARN = out.Table.TableArn
 			}
 			return err
@@ -222,18 +255,18 @@ func (d dynamoTableClient) DescribeTable(ctx context.Context, name string) (desc
 	}
 
 	err = d.backoffAndRetry(ctx, func(ctx context.Context) error {
-		return instrument.TimeRequestHistogram(ctx, "DynamoDB.ListTagsOfResource", dynamoRequestDuration, func(ctx context.Context) error {
+		return instrument.CollectedRequest(ctx, "DynamoDB.ListTagsOfResource", dynamoRequestDuration, instrument.ErrorCode, func(ctx context.Context) error {
 			out, err := d.DynamoDB.ListTagsOfResourceWithContext(ctx, &dynamodb.ListTagsOfResourceInput{
 				ResourceArn: tableARN,
 			})
-			if err != nil {
+			if relevantError(err) {
 				return err
 			}
 			desc.Tags = make(map[string]string, len(out.Tags))
 			for _, tag := range out.Tags {
 				desc.Tags[*tag.Key] = *tag.Value
 			}
-			return err
+			return nil
 		})
 	})
 
@@ -243,6 +276,18 @@ func (d dynamoTableClient) DescribeTable(ctx context.Context, name string) (desc
 	return
 }
 
+// Filter out errors that we don't want to see
+// (currently only relevant in integration tests)
+func relevantError(err error) bool {
+	if err == nil {
+		return false
+	}
+	if strings.Contains(err.Error(), "Tagging is not currently supported in DynamoDB Local.") {
+		return false
+	}
+	return true
+}
+
 func (d dynamoTableClient) UpdateTable(ctx context.Context, current, expected chunk.TableDesc) error {
 	if d.autoscale != nil {
 		err := d.autoscale.UpdateTable(ctx, current, &expected)
@@ -250,18 +295,53 @@ func (d dynamoTableClient) UpdateTable(ctx context.Context, current, expected ch
 			return err
 		}
 	}
-
-	if current.ProvisionedRead != expected.ProvisionedRead || current.ProvisionedWrite != expected.ProvisionedWrite {
+	level.Debug(util.Logger).Log("msg", "Updating Table",
+		"expectedWrite", expected.ProvisionedWrite,
+		"currentWrite", current.ProvisionedWrite,
+		"expectedRead", expected.ProvisionedRead,
+		"currentRead", current.ProvisionedRead,
+		"expectedOnDemandMode", expected.UseOnDemandIOMode,
+		"currentOnDemandMode", current.UseOnDemandIOMode)
+	if (current.ProvisionedRead != expected.ProvisionedRead ||
+		current.ProvisionedWrite != expected.ProvisionedWrite) &&
+		!expected.UseOnDemandIOMode {
 		level.Info(util.Logger).Log("msg", "updating provisioned throughput on table", "table", expected.Name, "old_read", current.ProvisionedRead, "old_write", current.ProvisionedWrite, "new_read", expected.ProvisionedRead, "new_write", expected.ProvisionedWrite)
 		if err := d.backoffAndRetry(ctx, func(ctx context.Context) error {
-			return instrument.TimeRequestHistogram(ctx, "DynamoDB.UpdateTable", dynamoRequestDuration, func(ctx context.Context) error {
-				_, err := d.DynamoDB.UpdateTableWithContext(ctx, &dynamodb.UpdateTableInput{
-					TableName: aws.String(expected.Name),
+			return instrument.CollectedRequest(ctx, "DynamoDB.UpdateTable", dynamoRequestDuration, instrument.ErrorCode, func(ctx context.Context) error {
+				var dynamoBillingMode string
+				updateTableInput := &dynamodb.UpdateTableInput{TableName: aws.String(expected.Name),
 					ProvisionedThroughput: &dynamodb.ProvisionedThroughput{
 						ReadCapacityUnits:  aws.Int64(expected.ProvisionedRead),
 						WriteCapacityUnits: aws.Int64(expected.ProvisionedWrite),
 					},
-				})
+				}
+				// we need this to be a separate check for the billing mode, as aws returns
+				// an error if we set a table to the billing mode it is currently on.
+				if current.UseOnDemandIOMode != expected.UseOnDemandIOMode {
+					dynamoBillingMode = dynamodb.BillingModeProvisioned
+					level.Info(util.Logger).Log("msg", "updating billing mode on table", "table", expected.Name, "old_mode", current.UseOnDemandIOMode, "new_mode", expected.UseOnDemandIOMode)
+					updateTableInput.BillingMode = aws.String(dynamoBillingMode)
+				}
+
+				_, err := d.DynamoDB.UpdateTableWithContext(ctx, updateTableInput)
+				return err
+			})
+		}); err != nil {
+			recordDynamoError(expected.Name, err, "DynamoDB.UpdateTable")
+			if awsErr, ok := err.(awserr.Error); ok && awsErr.Code() == "LimitExceededException" {
+				level.Warn(util.Logger).Log("msg", "update limit exceeded", "err", err)
+			} else {
+				return err
+			}
+		}
+	} else if expected.UseOnDemandIOMode && current.UseOnDemandIOMode != expected.UseOnDemandIOMode {
+		// moved the enabling of OnDemand mode to it's own block to reduce complexities & interactions with the various
+		// settings used in provisioned mode. Unfortunately the boilerplate wrappers for retry and tracking needed to be copied.
+		if err := d.backoffAndRetry(ctx, func(ctx context.Context) error {
+			return instrument.CollectedRequest(ctx, "DynamoDB.UpdateTable", dynamoRequestDuration, instrument.ErrorCode, func(ctx context.Context) error {
+				level.Info(util.Logger).Log("msg", "updating billing mode on table", "table", expected.Name, "old_mode", current.UseOnDemandIOMode, "new_mode", expected.UseOnDemandIOMode)
+				updateTableInput := &dynamodb.UpdateTableInput{TableName: aws.String(expected.Name), BillingMode: aws.String(dynamodb.BillingModePayPerRequest)}
+				_, err := d.DynamoDB.UpdateTableWithContext(ctx, updateTableInput)
 				return err
 			})
 		}); err != nil {
@@ -277,7 +357,7 @@ func (d dynamoTableClient) UpdateTable(ctx context.Context, current, expected ch
 	if !current.Tags.Equals(expected.Tags) {
 		var tableARN *string
 		if err := d.backoffAndRetry(ctx, func(ctx context.Context) error {
-			return instrument.TimeRequestHistogram(ctx, "DynamoDB.DescribeTable", dynamoRequestDuration, func(ctx context.Context) error {
+			return instrument.CollectedRequest(ctx, "DynamoDB.DescribeTable", dynamoRequestDuration, instrument.ErrorCode, func(ctx context.Context) error {
 				out, err := d.DynamoDB.DescribeTableWithContext(ctx, &dynamodb.DescribeTableInput{
 					TableName: aws.String(expected.Name),
 				})
@@ -294,12 +374,15 @@ func (d dynamoTableClient) UpdateTable(ctx context.Context, current, expected ch
 		}
 
 		return d.backoffAndRetry(ctx, func(ctx context.Context) error {
-			return instrument.TimeRequestHistogram(ctx, "DynamoDB.TagResource", dynamoRequestDuration, func(ctx context.Context) error {
+			return instrument.CollectedRequest(ctx, "DynamoDB.TagResource", dynamoRequestDuration, instrument.ErrorCode, func(ctx context.Context) error {
 				_, err := d.DynamoDB.TagResourceWithContext(ctx, &dynamodb.TagResourceInput{
 					ResourceArn: tableARN,
 					Tags:        chunkTagsToDynamoDB(expected.Tags),
 				})
-				return err
+				if relevantError(err) {
+					return errors.Wrap(err, "applying tags")
+				}
+				return nil
 			})
 		})
 	}

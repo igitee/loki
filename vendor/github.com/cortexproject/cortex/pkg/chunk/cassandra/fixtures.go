@@ -6,7 +6,6 @@ import (
 
 	"github.com/cortexproject/cortex/pkg/chunk"
 	"github.com/cortexproject/cortex/pkg/chunk/testutils"
-	"github.com/prometheus/common/model"
 )
 
 // GOCQL doesn't provide nice mocks, so we use a real Cassandra instance.
@@ -17,7 +16,7 @@ import (
 type fixture struct {
 	name         string
 	indexClient  chunk.IndexClient
-	chunkClient  chunk.ObjectClient
+	objectClient chunk.ObjectClient
 	tableClient  chunk.TableClient
 	schemaConfig chunk.SchemaConfig
 }
@@ -27,7 +26,7 @@ func (f fixture) Name() string {
 }
 
 func (f fixture) Clients() (chunk.IndexClient, chunk.ObjectClient, chunk.TableClient, chunk.SchemaConfig, error) {
-	return f.indexClient, f.chunkClient, f.tableClient, f.schemaConfig, nil
+	return f.indexClient, f.objectClient, f.tableClient, f.schemaConfig, nil
 }
 
 func (f fixture) Teardown() error {
@@ -42,14 +41,14 @@ func Fixtures() ([]testutils.Fixture, error) {
 	}
 
 	cfg := Config{
-		addresses:         addresses,
-		keyspace:          "test",
-		consistency:       "QUORUM",
-		replicationFactor: 1,
+		Addresses:         addresses,
+		Keyspace:          "test",
+		Consistency:       "QUORUM",
+		ReplicationFactor: 1,
 	}
 
 	// Get a SchemaConfig with the defaults.
-	schemaConfig := chunk.DefaultSchemaConfig("cassandra", "v1", model.Now())
+	schemaConfig := testutils.DefaultSchemaConfig("cassandra")
 
 	storageClient, err := NewStorageClient(cfg, schemaConfig)
 	if err != nil {
@@ -65,7 +64,7 @@ func Fixtures() ([]testutils.Fixture, error) {
 		fixture{
 			name:         "Cassandra",
 			indexClient:  storageClient,
-			chunkClient:  storageClient,
+			objectClient: storageClient,
 			tableClient:  tableClient,
 			schemaConfig: schemaConfig,
 		},

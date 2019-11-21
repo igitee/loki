@@ -2,7 +2,6 @@ package chunk
 
 import (
 	"bytes"
-	"context"
 	"encoding/binary"
 	"fmt"
 	"hash/crc32"
@@ -14,12 +13,10 @@ import (
 	"github.com/cortexproject/cortex/pkg/prom1/storage/metric"
 	"github.com/golang/snappy"
 	jsoniter "github.com/json-iterator/go"
-	ot "github.com/opentracing/opentracing-go"
-	otlog "github.com/opentracing/opentracing-go/log"
 	"github.com/pkg/errors"
 	"github.com/prometheus/common/model"
+	"github.com/prometheus/prometheus/pkg/labels"
 
-	"github.com/cortexproject/cortex/pkg/util"
 	errs "github.com/weaveworks/common/errors"
 )
 
@@ -45,9 +42,9 @@ type Chunk struct {
 	UserID      string            `json:"userID"`
 
 	// These fields will be in all chunks, including old ones.
-	From    model.Time   `json:"from"`
-	Through model.Time   `json:"through"`
-	Metric  model.Metric `json:"metric"`
+	From    model.Time    `json:"from"`
+	Through model.Time    `json:"through"`
+	Metric  labels.Labels `json:"metric"`
 
 	// The hash is not written to the external storage either.  We use
 	// crc32, Castagnoli table.  See http://www.evanjones.ca/crc32c.html.
@@ -69,7 +66,7 @@ type Chunk struct {
 }
 
 // NewChunk creates a new chunk
-func NewChunk(userID string, fp model.Fingerprint, metric model.Metric, c prom_chunk.Chunk, from, through model.Time) Chunk {
+func NewChunk(userID string, fp model.Fingerprint, metric labels.Labels, c prom_chunk.Chunk, from, through model.Time) Chunk {
 	return Chunk{
 		Fingerprint: fp,
 		UserID:      userID,
@@ -188,18 +185,14 @@ var writerPool = sync.Pool{
 	New: func() interface{} { return snappy.NewBufferedWriter(nil) },
 }
 
-// Encode writes the chunk out to a big write buffer, then calculates the checksum.
-func (c *Chunk) Encode() ([]byte, error) {
-	if c.encoded != nil {
-		return c.encoded, nil
-	}
-
+// Encode writes the chunk into a buffer, and calculates the checksum.
+func (c *Chunk) Encode() error {
 	var buf bytes.Buffer
 
 	// Write 4 empty bytes first - we will come back and put the len in here.
 	metadataLenBytes := [4]byte{}
 	if _, err := buf.Write(metadataLenBytes[:]); err != nil {
-		return nil, err
+		return err
 	}
 
 	// Encode chunk metadata into snappy-compressed buffer
@@ -208,7 +201,7 @@ func (c *Chunk) Encode() ([]byte, error) {
 	writer.Reset(&buf)
 	json := jsoniter.ConfigFastest
 	if err := json.NewEncoder(writer).Encode(c); err != nil {
-		return nil, err
+		return err
 	}
 	writer.Close()
 
@@ -221,12 +214,12 @@ func (c *Chunk) Encode() ([]byte, error) {
 	// Write another 4 empty bytes - we will come back and put the len in here.
 	dataLenBytes := [4]byte{}
 	if _, err := buf.Write(dataLenBytes[:]); err != nil {
-		return nil, err
+		return err
 	}
 
 	// And now the chunk data
 	if err := c.Data.Marshal(&buf); err != nil {
-		return nil, err
+		return err
 	}
 
 	// Now write the data len back into the buf.
@@ -237,6 +230,16 @@ func (c *Chunk) Encode() ([]byte, error) {
 	c.encoded = buf.Bytes()
 	c.ChecksumSet = true
 	c.Checksum = crc32.Checksum(c.encoded, castagnoliTable)
+	return nil
+}
+
+// Encoded returns the buffer created by Encoded()
+func (c *Chunk) Encoded() ([]byte, error) {
+	if c.encoded == nil {
+		if err := c.Encode(); err != nil {
+			return nil, err
+		}
+	}
 	return c.encoded, nil
 }
 
@@ -263,7 +266,7 @@ func (c *Chunk) Decode(decodeContext *DecodeContext, input []byte) error {
 			return err
 		}
 		c.encoded = input
-		return c.Data.UnmarshalFromBuf(input)
+		return errors.Wrap(c.Data.UnmarshalFromBuf(input), "when unmarshalling legacy chunk")
 	}
 
 	// First, calculate the checksum of the chunk and confirm it matches
@@ -276,17 +279,19 @@ func (c *Chunk) Decode(decodeContext *DecodeContext, input []byte) error {
 	r := bytes.NewReader(input)
 	var metadataLen uint32
 	if err := binary.Read(r, binary.BigEndian, &metadataLen); err != nil {
-		return err
+		return errors.Wrap(err, "when reading metadata length from chunk")
 	}
 	var tempMetadata Chunk
 	decodeContext.reader.Reset(r)
 	json := jsoniter.ConfigFastest
 	err := json.NewDecoder(decodeContext.reader).Decode(&tempMetadata)
 	if err != nil {
-		return err
+		return errors.Wrap(err, "when decoding chunk metadata")
 	}
-	if len(input)-r.Len() != int(metadataLen) {
-		return ErrMetadataLength
+	metadataRead := len(input) - r.Len()
+	// Older versions of Cortex included the initial length word; newer versions do not.
+	if !(metadataRead == int(metadataLen) || metadataRead == int(metadataLen)+4) {
+		return errors.Wrapf(ErrMetadataLength, "expected %d, got %d", metadataLen, metadataRead)
 	}
 
 	// Next, confirm the chunks matches what we expected.  Easiest way to do this
@@ -309,12 +314,12 @@ func (c *Chunk) Decode(decodeContext *DecodeContext, input []byte) error {
 	// Finally, unmarshal the actual chunk data.
 	c.Data, err = prom_chunk.NewForEncoding(c.Encoding)
 	if err != nil {
-		return err
+		return errors.Wrap(err, "when creating new chunk")
 	}
 
 	var dataLen uint32
 	if err := binary.Read(r, binary.BigEndian, &dataLen); err != nil {
-		return err
+		return errors.Wrap(err, "when reading data length from chunk")
 	}
 
 	c.encoded = input
@@ -331,40 +336,9 @@ func equalByKey(a, b Chunk) bool {
 		a.From == b.From && a.Through == b.Through && a.Checksum == b.Checksum
 }
 
-// ChunksToMatrix converts a set of chunks to a model.Matrix.
-func ChunksToMatrix(ctx context.Context, chunks []Chunk, from, through model.Time) (model.Matrix, error) {
-	sp, ctx := ot.StartSpanFromContext(ctx, "chunksToMatrix")
-	defer sp.Finish()
-	sp.LogFields(otlog.Int("chunks", len(chunks)))
-
-	// Group chunks by series, sort and dedupe samples.
-	metrics := map[model.Fingerprint]model.Metric{}
-	samplesBySeries := map[model.Fingerprint][][]model.SamplePair{}
-	for _, c := range chunks {
-		ss, err := c.Samples(from, through)
-		if err != nil {
-			return nil, err
-		}
-
-		metrics[c.Fingerprint] = c.Metric
-		samplesBySeries[c.Fingerprint] = append(samplesBySeries[c.Fingerprint], ss)
-	}
-	sp.LogFields(otlog.Int("series", len(samplesBySeries)))
-
-	matrix := make(model.Matrix, 0, len(samplesBySeries))
-	for fp, ss := range samplesBySeries {
-		matrix = append(matrix, &model.SampleStream{
-			Metric: metrics[fp],
-			Values: util.MergeNSampleSets(ss...),
-		})
-	}
-
-	return matrix, nil
-}
-
 // Samples returns all SamplePairs for the chunk.
 func (c *Chunk) Samples(from, through model.Time) ([]model.SamplePair, error) {
-	it := c.Data.NewIterator()
+	it := c.Data.NewIterator(nil)
 	interval := metric.Interval{OldestInclusive: from, NewestInclusive: through}
 	return prom_chunk.RangeValues(it, interval)
 }

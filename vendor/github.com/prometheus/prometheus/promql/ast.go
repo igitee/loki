@@ -14,8 +14,9 @@
 package promql
 
 import (
-	"fmt"
 	"time"
+
+	"github.com/pkg/errors"
 
 	"github.com/prometheus/prometheus/pkg/labels"
 	"github.com/prometheus/prometheus/storage"
@@ -116,6 +117,14 @@ type MatrixSelector struct {
 	series              []storage.Series
 }
 
+// SubqueryExpr represents a subquery.
+type SubqueryExpr struct {
+	Expr   Expr
+	Range  time.Duration
+	Offset time.Duration
+	Step   time.Duration
+}
+
 // NumberLiteral represents a number.
 type NumberLiteral struct {
 	Val float64
@@ -153,6 +162,7 @@ type VectorSelector struct {
 func (e *AggregateExpr) Type() ValueType  { return ValueTypeVector }
 func (e *Call) Type() ValueType           { return e.Func.ReturnType }
 func (e *MatrixSelector) Type() ValueType { return ValueTypeMatrix }
+func (e *SubqueryExpr) Type() ValueType   { return ValueTypeMatrix }
 func (e *NumberLiteral) Type() ValueType  { return ValueTypeScalar }
 func (e *ParenExpr) Type() ValueType      { return e.Expr.Type() }
 func (e *StringLiteral) Type() ValueType  { return ValueTypeString }
@@ -169,6 +179,7 @@ func (*AggregateExpr) expr()  {}
 func (*BinaryExpr) expr()     {}
 func (*Call) expr()           {}
 func (*MatrixSelector) expr() {}
+func (*SubqueryExpr) expr()   {}
 func (*NumberLiteral) expr()  {}
 func (*ParenExpr) expr()      {}
 func (*StringLiteral) expr()  {}
@@ -250,6 +261,11 @@ func Walk(v Visitor, node Node, path []Node) error {
 			}
 		}
 	case *AggregateExpr:
+		if n.Param != nil {
+			if err := Walk(v, n.Param, path); err != nil {
+				return err
+			}
+		}
 		if err := Walk(v, n.Expr, path); err != nil {
 			return err
 		}
@@ -267,6 +283,11 @@ func Walk(v Visitor, node Node, path []Node) error {
 			return err
 		}
 
+	case *SubqueryExpr:
+		if err := Walk(v, n.Expr, path); err != nil {
+			return err
+		}
+
 	case *ParenExpr:
 		if err := Walk(v, n.Expr, path); err != nil {
 			return err
@@ -281,7 +302,7 @@ func Walk(v Visitor, node Node, path []Node) error {
 		// nothing to do
 
 	default:
-		panic(fmt.Errorf("promql.Walk: unhandled node type %T", node))
+		panic(errors.Errorf("promql.Walk: unhandled node type %T", node))
 	}
 
 	_, err = v.Visit(nil, nil)
@@ -291,16 +312,17 @@ func Walk(v Visitor, node Node, path []Node) error {
 type inspector func(Node, []Node) error
 
 func (f inspector) Visit(node Node, path []Node) (Visitor, error) {
-	if err := f(node, path); err == nil {
-		return f, nil
-	} else {
+	if err := f(node, path); err != nil {
 		return nil, err
 	}
+
+	return f, nil
 }
 
 // Inspect traverses an AST in depth-first order: It starts by calling
 // f(node, path); node must not be nil. If f returns a nil error, Inspect invokes f
 // for all the non-nil children of node, recursively.
 func Inspect(node Node, f inspector) {
+	//nolint: errcheck
 	Walk(inspector(f), node, nil)
 }

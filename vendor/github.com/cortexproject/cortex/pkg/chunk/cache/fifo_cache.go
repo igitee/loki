@@ -56,8 +56,8 @@ var (
 
 // FifoCacheConfig holds config for the FifoCache.
 type FifoCacheConfig struct {
-	Size     int
-	Validity time.Duration
+	Size     int           `yaml:"size,omitempty"`
+	Validity time.Duration `yaml:"validity,omitempty"`
 }
 
 // RegisterFlagsWithPrefix adds the flags required to config this to the given FlagSet
@@ -78,7 +78,6 @@ type FifoCache struct {
 	// indexes into entries to identify the most recent and least recent entry.
 	first, last int
 
-	name            string
 	entriesAdded    prometheus.Counter
 	entriesAddedNew prometheus.Counter
 	entriesEvicted  prometheus.Counter
@@ -95,6 +94,7 @@ type cacheEntry struct {
 }
 
 // NewFifoCache returns a new initialised FifoCache of size.
+// TODO(bwplotka): Fix metrics, get them out of globals, separate or allow prefixing.
 func NewFifoCache(name string, cfg FifoCacheConfig) *FifoCache {
 	return &FifoCache{
 		size:     cfg.Size,
@@ -102,7 +102,7 @@ func NewFifoCache(name string, cfg FifoCacheConfig) *FifoCache {
 		entries:  make([]cacheEntry, 0, cfg.Size),
 		index:    make(map[string]int, cfg.Size),
 
-		name:            name,
+		// TODO(bwplotka): There might be simple cache.Cache wrapper for those.
 		entriesAdded:    cacheEntriesAdded.WithLabelValues(name),
 		entriesAddedNew: cacheEntriesAddedNew.WithLabelValues(name),
 		entriesEvicted:  cacheEntriesEvicted.WithLabelValues(name),

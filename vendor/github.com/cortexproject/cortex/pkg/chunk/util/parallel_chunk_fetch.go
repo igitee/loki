@@ -13,7 +13,7 @@ const maxParallel = 1000
 
 // GetParallelChunks fetches chunks in parallel (up to maxParallel).
 func GetParallelChunks(ctx context.Context, chunks []chunk.Chunk, f func(context.Context, *chunk.DecodeContext, chunk.Chunk) (chunk.Chunk, error)) ([]chunk.Chunk, error) {
-	sp, ctx := ot.StartSpanFromContext(ctx, "GetChunks")
+	sp, ctx := ot.StartSpanFromContext(ctx, "GetParallelChunks")
 	defer sp.Finish()
 	sp.LogFields(otlog.Int("chunks requested", len(chunks)))
 
@@ -29,7 +29,7 @@ func GetParallelChunks(ctx context.Context, chunks []chunk.Chunk, f func(context
 	processedChunks := make(chan chunk.Chunk)
 	errors := make(chan error)
 
-	for i := 0; i < max(maxParallel, len(chunks)); i++ {
+	for i := 0; i < min(maxParallel, len(chunks)); i++ {
 		go func() {
 			decodeContext := chunk.NewDecodeContext()
 			for c := range queuedChunks {
@@ -63,8 +63,8 @@ func GetParallelChunks(ctx context.Context, chunks []chunk.Chunk, f func(context
 	return result, lastErr
 }
 
-func max(a, b int) int {
-	if a > b {
+func min(a, b int) int {
+	if a < b {
 		return a
 	}
 	return b

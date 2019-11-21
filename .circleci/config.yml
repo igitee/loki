@@ -1,139 +1,141 @@
 version: 2
 
+.tags: &tags # tags need to be explicitely defined (whitelist)
+  tags: {only: "/.*/"}
+
+.only-tags: &only-tags
+  <<: *tags
+  branches: { ignore: "/.*/" }
+
+.tag-or-master: &tag-or-master
+  branches: { only: master }
+  <<: *tags
+
+.no-master: &no-master # contrary to tags, the branches must be excluded (blacklist)
+  branches: { ignore: master }
+
 workflows:
   version: 2
-  test-build-deploy:
+  default:
     jobs:
-    - test
-    - build
-    - lint
-    - publish:
-        requires:
-        - test
-        - build
-        - lint
-    - publish-master:
-        requires:
-        - test
-        - build
-        - lint
-        filters:
-          branches:
-            only: master
-    - deploy:
-        requires:
-        - publish
-        filters:
-          branches:
-            only: master
+      # publish jobs depend on this as well,
+      # thus tags need to be allowed for these
+      - test: {filters: {<<: *tags}}
+
+      - build/promtail-windows:
+          requires: [ test ]
+
+      - build/docker-driver:
+          requires: [ test ]
+          filters: {<<: *no-master}
+      - publish/docker-driver:
+          requires: [ test ]
+          filters: { <<: *tag-or-master }
+
+      - publish/binaries:
+          requires: [ test ]
+          filters: { <<: *only-tags }
+
+      - test-helm:
+          requires: [ test ]
+          filters: {<<: *tags}
+      - publish-helm:
+          requires: [ test-helm ]
+          filters: {<<: *tag-or-master}
+
 
 # https://circleci.com/blog/circleci-hacks-reuse-yaml-in-your-circleci-config-with-yaml/
-defaults: &defaults
+.defaults: &defaults
   docker:
-    - image: grafana/loki-build-image:rename-49e21d5-WIP
-  working_directory: /go/src/github.com/grafana/loki
+    - image: grafana/loki-build-image:0.7.4
+  working_directory: /src/loki
 
 jobs:
   test:
     <<: *defaults
     steps:
       - checkout
-
       - run:
-          name: Run Unit Tests
-          command: |
-            touch loki-build-image/.uptodate &&
-            make BUILD_IN_CONTAINER=false test
+          name: Unit Tests
+          command: make BUILD_IN_CONTAINER=false test
 
-  lint:
+  # Promtail
+  build/promtail-windows:
     <<: *defaults
     steps:
       - checkout
-
       - run:
-          name: Lint
-          command: |
-            touch loki-build-image/.uptodate &&
-            make BUILD_IN_CONTAINER=false lint
+          name: build
+          command: make GOOS=windows GOGC=10 promtail
 
-      - run:
-          name: Check Generated Fies
-          command: |
-            touch loki-build-image/.uptodate &&
-            make BUILD_IN_CONTAINER=false check-generated-files
-
-  build:
+  # Docker driver
+  build/docker-driver:
     <<: *defaults
     steps:
       - checkout
       - setup_remote_docker
-
       - run:
-          name: Build Images
-          command: |
-            touch loki-build-image/.uptodate &&
-            make BUILD_IN_CONTAINER=false
+          name: docker-driver
+          command: make docker-driver
 
-      - run:
-          name: Save Images
-          command: |
-            touch loki-build-image/.uptodate &&
-            make BUILD_IN_CONTAINER=false save-images
-
-      - save_cache:
-          key: v1-loki-{{ .Branch }}-{{ .Revision }}
-          paths:
-          - images/
-
-  publish:
+  publish/docker-driver:
     <<: *defaults
     steps:
       - checkout
       - setup_remote_docker
-
-      - restore_cache:
-          key: v1-loki-{{ .Branch }}-{{ .Revision }}
-
       - run:
-          name: Load Images
-          command: |
-            touch loki-build-image/.uptodate &&
-            make BUILD_IN_CONTAINER=false load-images
-
+          name: login
+          command: docker login -u "$DOCKER_USER" -p "$DOCKER_PASS"
       - run:
-          name: Push Images
-          command: |
-            docker login -u "$DOCKER_USER" -p "$DOCKER_PASS" &&
-            make push-images
+          name: docker-driver
+          command: make docker-driver-push
 
-  publish-master:
+  publish/binaries:
     <<: *defaults
     steps:
       - checkout
-      - setup_remote_docker
-
-      - restore_cache:
-          key: v1-loki-{{ .Branch }}-{{ .Revision }}
-
       - run:
-          name: Load Images
-          command: |
-            touch loki-build-image/.uptodate &&
-            make BUILD_IN_CONTAINER=false load-images
+          name: github release
+          command: make BUILD_IN_CONTAINER=false publish
 
-      - run:
-          name: Push Images
-          command: |
-            docker login -u "$DOCKER_USER" -p "$DOCKER_PASS" &&
-            make push-master
-
-  deploy:
-    <<: *defaults
+  test-helm:
+    environment:
+      CT_VERSION: 2.3.3
+    machine:
+      image: ubuntu-1604:201903-01
     steps:
       - checkout
+      - run:
+          name: Install k3s
+          command: |
+            curl -sfL https://get.k3s.io | sh -
+            sudo chmod 755 /etc/rancher/k3s/k3s.yaml
+            mkdir -p ~/.kube
+            cp /etc/rancher/k3s/k3s.yaml ~/.kube/config
+      - run:
+          name: Install Helm
+          command: |
+            curl -L https://git.io/get_helm.sh | bash
+            kubectl apply -f tools/helm.yaml
+            helm init --service-account helm --wait
+      - run:
+          name: Install Chart Testing tool
+          command: |
+            pip install yamale yamllint
+            curl -Lo ct.tgz https://github.com/helm/chart-testing/releases/download/v${CT_VERSION}/chart-testing_${CT_VERSION}_linux_amd64.tar.gz
+            sudo tar -C /usr/local/bin -xvf ct.tgz
+            sudo mv /usr/local/bin/etc /etc/ct/
+      - run:
+          name: Run Chart Tests
+          command: |
+            ct lint --chart-dirs=production/helm --check-version-increment=false --validate-maintainers=false
+            ct install --build-id=${CIRCLE_BUILD_NUM} --charts production/helm/loki-stack
 
-      - run: |
-          curl -s --header "Content-Type: application/json" \
-            --data "{\"build_parameters\": {\"CIRCLE_JOB\": \"deploy\", \"IMAGE_NAMES\": \"$(make images)\"}}" \
-            --request POST \
-            https://circleci.com/api/v1.1/project/github/raintank/deployment_tools/tree/master?circle-token=$CIRCLE_TOKEN
+  publish-helm:
+    <<: *defaults
+    steps:
+      - add_ssh_keys:
+          fingerprints:
+            - "5a:d3:08:5e:f7:53:a0:c4:e9:5d:83:c6:02:6a:d9:bd"
+      - checkout
+      - run: make helm-publish

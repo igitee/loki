@@ -2,44 +2,54 @@ package promtail
 
 import (
 	"github.com/cortexproject/cortex/pkg/util"
-	"github.com/weaveworks/common/server"
+
+	"github.com/grafana/loki/pkg/promtail/client"
+	"github.com/grafana/loki/pkg/promtail/config"
+	"github.com/grafana/loki/pkg/promtail/positions"
+	"github.com/grafana/loki/pkg/promtail/server"
+	"github.com/grafana/loki/pkg/promtail/targets"
 )
 
 // Promtail is the root struct for Promtail...
 type Promtail struct {
-	client        *Client
-	positions     *Positions
-	targetManager *TargetManager
-	server        *server.Server
+	client         client.Client
+	positions      *positions.Positions
+	targetManagers *targets.TargetManagers
+	server         *server.Server
 }
 
 // New makes a new Promtail.
-func New(cfg Config) (*Promtail, error) {
-	positions, err := NewPositions(util.Logger, cfg.PositionsConfig)
+func New(cfg config.Config) (*Promtail, error) {
+	positions, err := positions.New(util.Logger, cfg.PositionsConfig)
 	if err != nil {
 		return nil, err
 	}
 
-	client, err := NewClient(cfg.ClientConfig, util.Logger)
+	if cfg.ClientConfig.URL.URL != nil {
+		// if a single client config is used we add it to the multiple client config for backward compatibility
+		cfg.ClientConfigs = append(cfg.ClientConfigs, cfg.ClientConfig)
+	}
+
+	client, err := client.NewMulti(util.Logger, cfg.ClientConfigs...)
 	if err != nil {
 		return nil, err
 	}
 
-	tm, err := NewTargetManager(util.Logger, positions, client, cfg.ScrapeConfig)
+	tms, err := targets.NewTargetManagers(util.Logger, positions, client, cfg.ScrapeConfig, &cfg.TargetConfig)
 	if err != nil {
 		return nil, err
 	}
 
-	server, err := server.New(cfg.ServerConfig)
+	server, err := server.New(cfg.ServerConfig, tms)
 	if err != nil {
 		return nil, err
 	}
 
 	return &Promtail{
-		client:        client,
-		positions:     positions,
-		targetManager: tm,
-		server:        server,
+		client:         client,
+		positions:      positions,
+		targetManagers: tms,
+		server:         server,
 	}, nil
 }
 
@@ -51,6 +61,7 @@ func (p *Promtail) Run() error {
 // Shutdown the promtail.
 func (p *Promtail) Shutdown() {
 	p.server.Shutdown()
-	p.targetManager.Stop()
+	p.targetManagers.Stop()
+	p.positions.Stop()
 	p.client.Stop()
 }

@@ -14,13 +14,26 @@ import (
 	"github.com/cortexproject/cortex/pkg/chunk/gcp"
 	"github.com/cortexproject/cortex/pkg/chunk/local"
 	"github.com/cortexproject/cortex/pkg/util"
-	"github.com/cortexproject/cortex/pkg/util/validation"
 	"github.com/go-kit/kit/log/level"
 	"github.com/pkg/errors"
 )
 
+// Supported storage engines
+const (
+	StorageEngineChunks = "chunks"
+	StorageEngineTSDB   = "tsdb"
+)
+
+// StoreLimits helps get Limits specific to Queries for Stores
+type StoreLimits interface {
+	CardinalityLimit(userID string) int
+	MaxChunksPerQuery(userID string) int
+	MaxQueryLength(userID string) time.Duration
+}
+
 // Config chooses which storage client to use.
 type Config struct {
+	Engine                 string             `yaml:"engine"`
 	AWSStorageConfig       aws.StorageConfig  `yaml:"aws"`
 	GCPStorageConfig       gcp.Config         `yaml:"bigtable"`
 	GCSConfig              gcp.GCSConfig      `yaml:"gcs"`
@@ -28,11 +41,9 @@ type Config struct {
 	BoltDBConfig           local.BoltDBConfig `yaml:"boltdb"`
 	FSConfig               local.FSConfig     `yaml:"filesystem"`
 
-	IndexCacheSize     int
 	IndexCacheValidity time.Duration
-	memcacheClient     cache.MemcachedClientConfig
 
-	indexQueriesCacheConfig cache.Config
+	IndexQueriesCacheConfig cache.Config `yaml:"index_queries_cache_config,omitempty"`
 }
 
 // RegisterFlags adds the flags required to configure this flag set.
@@ -44,44 +55,25 @@ func (cfg *Config) RegisterFlags(f *flag.FlagSet) {
 	cfg.BoltDBConfig.RegisterFlags(f)
 	cfg.FSConfig.RegisterFlags(f)
 
-	// Deprecated flags!!
-	f.IntVar(&cfg.IndexCacheSize, "store.index-cache-size", 0, "Deprecated: Use -store.index-cache-read.*; Size of in-memory index cache, 0 to disable.")
-	f.DurationVar(&cfg.IndexCacheValidity, "store.index-cache-validity", 5*time.Minute, "Deprecated: Use -store.index-cache-read.*; Period for which entries in the index cache are valid. Should be no higher than -ingester.max-chunk-idle.")
-	cfg.memcacheClient.RegisterFlagsWithPrefix("index.", "Deprecated: Use -store.index-cache-read.*;", f)
+	f.StringVar(&cfg.Engine, "store.engine", "chunks", "The storage engine to use: chunks or tsdb. Be aware tsdb is experimental and shouldn't be used in production.")
+	cfg.IndexQueriesCacheConfig.RegisterFlagsWithPrefix("store.index-cache-read.", "Cache config for index entry reading. ", f)
+	f.DurationVar(&cfg.IndexCacheValidity, "store.index-cache-validity", 5*time.Minute, "Cache validity for active index entries. Should be no higher than -ingester.max-chunk-idle.")
+}
 
-	cfg.indexQueriesCacheConfig.RegisterFlagsWithPrefix("store.index-cache-read.", "Cache config for index entry reading. ", f)
+// Validate config and returns error on failure
+func (cfg *Config) Validate() error {
+	if cfg.Engine != StorageEngineChunks && cfg.Engine != StorageEngineTSDB {
+		return errors.New("unsupported storage engine")
+	}
+
+	return nil
 }
 
 // NewStore makes the storage clients based on the configuration.
-func NewStore(cfg Config, storeCfg chunk.StoreConfig, schemaCfg chunk.SchemaConfig, limits *validation.Overrides) (chunk.Store, error) {
-	var err error
-
-	// Building up from deprecated flags.
-	var caches []cache.Cache
-	if cfg.IndexCacheSize > 0 {
-		fifocache := cache.Instrument("fifo-index", cache.NewFifoCache("index", cache.FifoCacheConfig{Size: cfg.IndexCacheSize, Validity: cfg.IndexCacheValidity}))
-		caches = append(caches, fifocache)
-	}
-	if cfg.memcacheClient.Host != "" {
-		client := cache.NewMemcachedClient(cfg.memcacheClient)
-		memcache := cache.Instrument("memcache-index", cache.NewMemcached(cache.MemcachedConfig{
-			Expiration: cfg.IndexCacheValidity,
-		}, client))
-		caches = append(caches, cache.NewBackground("memcache-index", cache.BackgroundConfig{
-			WriteBackGoroutines: 10,
-			WriteBackBuffer:     100,
-		}, memcache))
-	}
-
-	var tieredCache cache.Cache
-	if len(caches) > 0 {
-		tieredCache = cache.NewTiered(caches)
-		cfg.indexQueriesCacheConfig.DefaultValidity = cfg.IndexCacheValidity
-	} else {
-		tieredCache, err = cache.New(cfg.indexQueriesCacheConfig)
-		if err != nil {
-			return nil, err
-		}
+func NewStore(cfg Config, storeCfg chunk.StoreConfig, schemaCfg chunk.SchemaConfig, limits StoreLimits) (chunk.Store, error) {
+	tieredCache, err := cache.New(cfg.IndexQueriesCacheConfig)
+	if err != nil {
+		return nil, err
 	}
 
 	// Cache is shared by multiple stores, which means they will try and Stop
@@ -99,7 +91,7 @@ func NewStore(cfg Config, storeCfg chunk.StoreConfig, schemaCfg chunk.SchemaConf
 		if err != nil {
 			return nil, errors.Wrap(err, "error creating index client")
 		}
-		index = newCachingIndexClient(index, tieredCache, cfg.IndexCacheValidity)
+		index = newCachingIndexClient(index, tieredCache, cfg.IndexCacheValidity, limits)
 
 		objectStoreType := s.ObjectType
 		if objectStoreType == "" {
@@ -125,7 +117,7 @@ func NewIndexClient(name string, cfg Config, schemaCfg chunk.SchemaConfig) (chun
 	case "inmemory":
 		store := chunk.NewMockStorage()
 		return store, nil
-	case "aws", "aws-dynamo", "dynamo":
+	case "aws", "aws-dynamo":
 		if cfg.AWSStorageConfig.DynamoDB.URL == nil {
 			return nil, fmt.Errorf("Must set -dynamodb.url in aws mode")
 		}
@@ -133,17 +125,20 @@ func NewIndexClient(name string, cfg Config, schemaCfg chunk.SchemaConfig) (chun
 		if len(path) > 0 {
 			level.Warn(util.Logger).Log("msg", "ignoring DynamoDB URL path", "path", path)
 		}
-		return aws.NewDynamoDBStorageClient(cfg.AWSStorageConfig.DynamoDBConfig, schemaCfg)
+		return aws.NewDynamoDBIndexClient(cfg.AWSStorageConfig.DynamoDBConfig, schemaCfg)
 	case "gcp":
 		return gcp.NewStorageClientV1(context.Background(), cfg.GCPStorageConfig, schemaCfg)
 	case "gcp-columnkey", "bigtable":
+		return gcp.NewStorageClientColumnKey(context.Background(), cfg.GCPStorageConfig, schemaCfg)
+	case "bigtable-hashed":
+		cfg.GCPStorageConfig.DistributeKeys = true
 		return gcp.NewStorageClientColumnKey(context.Background(), cfg.GCPStorageConfig, schemaCfg)
 	case "cassandra":
 		return cassandra.NewStorageClient(cfg.CassandraStorageConfig, schemaCfg)
 	case "boltdb":
 		return local.NewBoltDBIndexClient(cfg.BoltDBConfig)
 	default:
-		return nil, fmt.Errorf("Unrecognized storage client %v, choose one of: aws, gcp, cassandra, inmemory", name)
+		return nil, fmt.Errorf("Unrecognized storage client %v, choose one of: aws, cassandra, inmemory, gcp, bigtable, bigtable-hashed", name)
 	}
 }
 
@@ -155,7 +150,7 @@ func NewObjectClient(name string, cfg Config, schemaCfg chunk.SchemaConfig) (chu
 		return store, nil
 	case "aws", "s3":
 		return aws.NewS3ObjectClient(cfg.AWSStorageConfig, schemaCfg)
-	case "aws-dynamo", "dynamo":
+	case "aws-dynamo":
 		if cfg.AWSStorageConfig.DynamoDB.URL == nil {
 			return nil, fmt.Errorf("Must set -dynamodb.url in aws mode")
 		}
@@ -163,19 +158,19 @@ func NewObjectClient(name string, cfg Config, schemaCfg chunk.SchemaConfig) (chu
 		if len(path) > 0 {
 			level.Warn(util.Logger).Log("msg", "ignoring DynamoDB URL path", "path", path)
 		}
-		return aws.NewDynamoDBStorageClient(cfg.AWSStorageConfig.DynamoDBConfig, schemaCfg)
+		return aws.NewDynamoDBObjectClient(cfg.AWSStorageConfig.DynamoDBConfig, schemaCfg)
 	case "gcp":
-		return gcp.NewBigtableChunkClient(context.Background(), cfg.GCPStorageConfig, schemaCfg)
-	case "gcp-columnkey", "bigtable":
-		return gcp.NewBigtableChunkClient(context.Background(), cfg.GCPStorageConfig, schemaCfg)
+		return gcp.NewBigtableObjectClient(context.Background(), cfg.GCPStorageConfig, schemaCfg)
+	case "gcp-columnkey", "bigtable", "bigtable-hashed":
+		return gcp.NewBigtableObjectClient(context.Background(), cfg.GCPStorageConfig, schemaCfg)
 	case "gcs":
-		return gcp.NewGCSChunkClient(context.Background(), cfg.GCSConfig, schemaCfg)
+		return gcp.NewGCSObjectClient(context.Background(), cfg.GCSConfig, schemaCfg)
 	case "cassandra":
 		return cassandra.NewStorageClient(cfg.CassandraStorageConfig, schemaCfg)
 	case "filesystem":
 		return local.NewFSObjectClient(cfg.FSConfig)
 	default:
-		return nil, fmt.Errorf("Unrecognized storage client %v, choose one of: aws, gcp, cassandra, inmemory", name)
+		return nil, fmt.Errorf("Unrecognized storage client %v, choose one of: aws, cassandra, inmemory, gcp, bigtable, bigtable-hashed", name)
 	}
 }
 
@@ -185,18 +180,30 @@ func NewTableClient(name string, cfg Config) (chunk.TableClient, error) {
 	case "inmemory":
 		return chunk.NewMockStorage(), nil
 	case "aws", "aws-dynamo":
+		if cfg.AWSStorageConfig.DynamoDB.URL == nil {
+			return nil, fmt.Errorf("Must set -dynamodb.url in aws mode")
+		}
 		path := strings.TrimPrefix(cfg.AWSStorageConfig.DynamoDB.URL.Path, "/")
 		if len(path) > 0 {
 			level.Warn(util.Logger).Log("msg", "ignoring DynamoDB URL path", "path", path)
 		}
 		return aws.NewDynamoDBTableClient(cfg.AWSStorageConfig.DynamoDBConfig)
-	case "gcp", "gcp-columnkey":
+	case "gcp", "gcp-columnkey", "bigtable", "bigtable-hashed":
 		return gcp.NewTableClient(context.Background(), cfg.GCPStorageConfig)
 	case "cassandra":
 		return cassandra.NewTableClient(context.Background(), cfg.CassandraStorageConfig)
 	case "boltdb":
-		return local.NewTableClient()
+		return local.NewTableClient(cfg.BoltDBConfig.Directory)
 	default:
-		return nil, fmt.Errorf("Unrecognized storage client %v, choose one of: aws, gcp, inmemory", name)
+		return nil, fmt.Errorf("Unrecognized storage client %v, choose one of: aws, cassandra, inmemory, gcp, bigtable, bigtable-hashed", name)
 	}
+}
+
+// NewBucketClient makes a new bucket client based on the configuration.
+func NewBucketClient(storageConfig Config) (chunk.BucketClient, error) {
+	if storageConfig.FSConfig.Directory != "" {
+		return local.NewFSObjectClient(storageConfig.FSConfig)
+	}
+
+	return nil, nil
 }

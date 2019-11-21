@@ -3,9 +3,12 @@ package gcp
 import (
 	"bytes"
 	"context"
+	"encoding/binary"
+	"encoding/hex"
 	"flag"
 	"fmt"
 	"strings"
+	"time"
 
 	"cloud.google.com/go/bigtable"
 	ot "github.com/opentracing/opentracing-go"
@@ -14,6 +17,7 @@ import (
 	"github.com/cortexproject/cortex/pkg/chunk"
 	chunk_util "github.com/cortexproject/cortex/pkg/chunk/util"
 	"github.com/cortexproject/cortex/pkg/util"
+	"github.com/cortexproject/cortex/pkg/util/grpcclient"
 	"github.com/pkg/errors"
 )
 
@@ -23,19 +27,30 @@ const (
 	column       = "c"
 	separator    = "\000"
 	maxRowReads  = 100
-	null         = string('\xff')
 )
 
 // Config for a StorageClient
 type Config struct {
 	Project  string `yaml:"project"`
 	Instance string `yaml:"instance"`
+
+	GRPCClientConfig grpcclient.Config `yaml:"grpc_client_config"`
+
+	ColumnKey      bool
+	DistributeKeys bool
+
+	TableCacheEnabled    bool
+	TableCacheExpiration time.Duration
 }
 
 // RegisterFlags adds the flags required to config this to the given FlagSet
 func (cfg *Config) RegisterFlags(f *flag.FlagSet) {
 	f.StringVar(&cfg.Project, "bigtable.project", "", "Bigtable project ID.")
 	f.StringVar(&cfg.Instance, "bigtable.instance", "", "Bigtable instance ID.")
+	f.BoolVar(&cfg.TableCacheEnabled, "bigtable.table-cache.enabled", true, "If enabled, once a tables info is fetched, it is cached.")
+	f.DurationVar(&cfg.TableCacheExpiration, "bigtable.table-cache.expiration", 30*time.Minute, "Duration to cache tables before checking again.")
+
+	cfg.GRPCClientConfig.RegisterFlags("bigtable", f)
 }
 
 // storageClientColumnKey implements chunk.storageClient for GCP.
@@ -44,6 +59,8 @@ type storageClientColumnKey struct {
 	schemaCfg chunk.SchemaConfig
 	client    *bigtable.Client
 	keysFn    keysFn
+
+	distributeKeys bool
 }
 
 // storageClientV1 implements chunk.storageClient for GCP.
@@ -53,7 +70,8 @@ type storageClientV1 struct {
 
 // NewStorageClientV1 returns a new v1 StorageClient.
 func NewStorageClientV1(ctx context.Context, cfg Config, schemaCfg chunk.SchemaConfig) (chunk.IndexClient, error) {
-	client, err := bigtable.NewClient(ctx, cfg.Project, cfg.Instance, instrumentation()...)
+	opts := toOptions(cfg.GRPCClientConfig.DialOption(bigtableInstrumentation()))
+	client, err := bigtable.NewClient(ctx, cfg.Project, cfg.Instance, opts...)
 	if err != nil {
 		return nil, err
 	}
@@ -76,7 +94,8 @@ func newStorageClientV1(cfg Config, schemaCfg chunk.SchemaConfig, client *bigtab
 
 // NewStorageClientColumnKey returns a new v2 StorageClient.
 func NewStorageClientColumnKey(ctx context.Context, cfg Config, schemaCfg chunk.SchemaConfig) (chunk.IndexClient, error) {
-	client, err := bigtable.NewClient(ctx, cfg.Project, cfg.Instance, instrumentation()...)
+	opts := toOptions(cfg.GRPCClientConfig.DialOption(bigtableInstrumentation()))
+	client, err := bigtable.NewClient(ctx, cfg.Project, cfg.Instance, opts...)
 	if err != nil {
 		return nil, err
 	}
@@ -84,16 +103,33 @@ func NewStorageClientColumnKey(ctx context.Context, cfg Config, schemaCfg chunk.
 }
 
 func newStorageClientColumnKey(cfg Config, schemaCfg chunk.SchemaConfig, client *bigtable.Client) *storageClientColumnKey {
+
 	return &storageClientColumnKey{
 		cfg:       cfg,
 		schemaCfg: schemaCfg,
 		client:    client,
 		keysFn: func(hashValue string, rangeValue []byte) (string, string) {
-			// We could hash the row key for better distribution but we decided against it
-			// because that would make migrations very, very hard.
+
+			// We hash the row key and prepend it back to the key for better distribution.
+			// We preserve the existing key to make migrations and o11y easier.
+			if cfg.DistributeKeys {
+				hashValue = hashPrefix(hashValue) + "-" + hashValue
+			}
+
 			return hashValue, string(rangeValue)
 		},
 	}
+}
+
+// hashPrefix calculates a 64bit hash of the input string and hex-encodes
+// the result, taking care to zero pad etc.
+func hashPrefix(input string) string {
+	prefix := hashAdd(hashNew(), input)
+	var encodedUint64 [8]byte
+	binary.LittleEndian.PutUint64(encodedUint64[:], prefix)
+	var hexEncoded [16]byte
+	hex.Encode(hexEncoded[:], encodedUint64[:])
+	return string(hexEncoded[:])
 }
 
 func (s *storageClientColumnKey) Stop() {
@@ -182,8 +218,9 @@ func (s *storageClientColumnKey) QueryPages(ctx context.Context, queries []chunk
 				queries: map[string]chunk.IndexQuery{},
 			}
 		}
-		tq.queries[query.HashValue] = query
-		tq.rows = append(tq.rows, query.HashValue)
+		hashKey, _ := s.keysFn(query.HashValue, nil)
+		tq.queries[hashKey] = query
+		tq.rows = append(tq.rows, hashKey)
 		tableQueries[query.TableName] = tq
 	}
 
@@ -233,50 +270,6 @@ func (s *storageClientColumnKey) QueryPages(ctx context.Context, queries []chunk
 		}
 	}
 	return lastErr
-}
-
-func (s *storageClientColumnKey) query(ctx context.Context, query chunk.IndexQuery, callback func(result chunk.ReadBatch) (shouldContinue bool)) error {
-	sp, ctx := ot.StartSpanFromContext(ctx, "QueryPages", ot.Tag{Key: "tableName", Value: query.TableName}, ot.Tag{Key: "hashValue", Value: query.HashValue})
-	defer sp.Finish()
-
-	table := s.client.Open(query.TableName)
-
-	rOpts := []bigtable.ReadOption{
-		bigtable.RowFilter(bigtable.FamilyFilter(columnFamily)),
-	}
-
-	if len(query.RangeValuePrefix) > 0 {
-		rOpts = append(rOpts, bigtable.RowFilter(bigtable.ColumnRangeFilter(columnFamily, string(query.RangeValuePrefix), string(query.RangeValuePrefix)+null)))
-	} else if len(query.RangeValueStart) > 0 {
-		rOpts = append(rOpts, bigtable.RowFilter(bigtable.ColumnRangeFilter(columnFamily, string(query.RangeValueStart), null)))
-	}
-
-	r, err := table.ReadRow(ctx, query.HashValue, rOpts...)
-	if err != nil {
-		sp.LogFields(otlog.String("error", err.Error()))
-		return errors.WithStack(err)
-	}
-
-	val, ok := r[columnFamily]
-	if !ok {
-		// There are no matching rows.
-		return nil
-	}
-
-	if query.ValueEqual != nil {
-		filteredItems := make([]bigtable.ReadItem, 0, len(val))
-		for _, item := range val {
-			if bytes.Equal(query.ValueEqual, item.Value) {
-				filteredItems = append(filteredItems, item)
-			}
-		}
-
-		val = filteredItems
-	}
-	callback(&columnKeyBatch{
-		items: val,
-	})
-	return nil
 }
 
 // columnKeyBatch represents a batch of values read from Bigtable.
@@ -332,7 +325,6 @@ func (s *storageClientV1) query(ctx context.Context, query chunk.IndexQuery, cal
 		readOpts = append(readOpts, bigtable.RowFilter(bigtable.ValueFilter(string(query.ValueEqual))))
 	}
 	*/
-
 	if len(query.RangeValuePrefix) > 0 {
 		rowRange = bigtable.PrefixRange(query.HashValue + separator + string(query.RangeValuePrefix))
 	} else if len(query.RangeValueStart) > 0 {

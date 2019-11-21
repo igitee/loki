@@ -10,13 +10,13 @@ import (
 )
 
 var (
-	requestDuration = prometheus.NewHistogramVec(prometheus.HistogramOpts{
+	requestDuration = instr.NewHistogramCollector(prometheus.NewHistogramVec(prometheus.HistogramOpts{
 		Namespace: "cortex",
 		Name:      "cache_request_duration_seconds",
 		Help:      "Total time spent in seconds doing cache requests.",
 		// Cache requests are very quick: smallest bucket is 16us, biggest is 1s.
 		Buckets: prometheus.ExponentialBuckets(0.000016, 4, 8),
-	}, []string{"method", "status_code"})
+	}, []string{"method", "status_code"}))
 
 	fetchedKeys = prometheus.NewCounterVec(prometheus.CounterOpts{
 		Namespace: "cortex",
@@ -29,33 +29,53 @@ var (
 		Name:      "cache_hits",
 		Help:      "Total count of keys found in cache.",
 	}, []string{"name"})
+
+	valueSize = prometheus.NewHistogramVec(prometheus.HistogramOpts{
+		Namespace: "cortex",
+		Name:      "cache_value_size_bytes",
+		Help:      "Size of values in the cache.",
+		// Cached chunks are generally in the KBs, but cached index can
+		// get big.  Histogram goes from 1KB to 4MB.
+		// 1024 * 4^(7-1) = 4MB
+		Buckets: prometheus.ExponentialBuckets(1024, 4, 7),
+	}, []string{"name", "method"})
 )
 
 func init() {
-	prometheus.MustRegister(requestDuration)
+	requestDuration.Register()
 	prometheus.MustRegister(fetchedKeys)
 	prometheus.MustRegister(hits)
+	prometheus.MustRegister(valueSize)
 }
 
 // Instrument returns an instrumented cache.
 func Instrument(name string, cache Cache) Cache {
 	return &instrumentedCache{
-		name:        name,
-		fetchedKeys: fetchedKeys.WithLabelValues(name),
-		hits:        hits.WithLabelValues(name),
-		Cache:       cache,
+		name:  name,
+		Cache: cache,
+
+		fetchedKeys:      fetchedKeys.WithLabelValues(name),
+		hits:             hits.WithLabelValues(name),
+		storedValueSize:  valueSize.WithLabelValues(name, "store"),
+		fetchedValueSize: valueSize.WithLabelValues(name, "fetch"),
 	}
 }
 
 type instrumentedCache struct {
-	name              string
-	fetchedKeys, hits prometheus.Counter
+	name string
 	Cache
+
+	fetchedKeys, hits                 prometheus.Counter
+	storedValueSize, fetchedValueSize prometheus.Observer
 }
 
 func (i *instrumentedCache) Store(ctx context.Context, keys []string, bufs [][]byte) {
+	for j := range bufs {
+		i.storedValueSize.Observe(float64(len(bufs[j])))
+	}
+
 	method := i.name + ".store"
-	instr.TimeRequestHistogram(ctx, method, requestDuration, func(ctx context.Context) error {
+	instr.CollectedRequest(ctx, method, requestDuration, instr.ErrorCode, func(ctx context.Context) error {
 		sp := ot.SpanFromContext(ctx)
 		sp.LogFields(otlog.Int("keys", len(keys)))
 		i.Cache.Store(ctx, keys, bufs)
@@ -71,7 +91,7 @@ func (i *instrumentedCache) Fetch(ctx context.Context, keys []string) ([]string,
 		method  = i.name + ".fetch"
 	)
 
-	instr.TimeRequestHistogram(ctx, method, requestDuration, func(ctx context.Context) error {
+	instr.CollectedRequest(ctx, method, requestDuration, instr.ErrorCode, func(ctx context.Context) error {
 		sp := ot.SpanFromContext(ctx)
 		sp.LogFields(otlog.Int("keys requested", len(keys)))
 
@@ -82,6 +102,10 @@ func (i *instrumentedCache) Fetch(ctx context.Context, keys []string) ([]string,
 
 	i.fetchedKeys.Add(float64(len(keys)))
 	i.hits.Add(float64(len(found)))
+	for j := range bufs {
+		i.fetchedValueSize.Observe(float64(len(bufs[j])))
+	}
+
 	return found, bufs, missing
 }
 

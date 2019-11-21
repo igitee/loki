@@ -74,6 +74,20 @@ func (m *MockStorage) CreateTable(_ context.Context, desc TableDesc) error {
 	return nil
 }
 
+// DeleteTable implements StorageClient.
+func (m *MockStorage) DeleteTable(_ context.Context, name string) error {
+	m.mtx.Lock()
+	defer m.mtx.Unlock()
+
+	if _, ok := m.tables[name]; !ok {
+		return fmt.Errorf("table does not exist")
+	}
+
+	delete(m.tables, name)
+
+	return nil
+}
+
 // DescribeTable implements StorageClient.
 func (m *MockStorage) DescribeTable(_ context.Context, name string) (desc TableDesc, isActive bool, err error) {
 	m.mtx.RLock()
@@ -151,6 +165,7 @@ func (m *MockStorage) BatchWrite(ctx context.Context, batch WriteBatch) error {
 			itemComponents := decodeRangeKey(items[i].rangeValue)
 			if !bytes.Equal(itemComponents[3], metricNameRangeKeyV1) &&
 				!bytes.Equal(itemComponents[3], seriesRangeKeyV1) &&
+				!bytes.Equal(itemComponents[3], labelNamesRangeKeyV1) &&
 				!bytes.Equal(itemComponents[3], labelSeriesRangeKeyV1) {
 				return fmt.Errorf("Dupe write")
 			}
@@ -252,9 +267,7 @@ func (m *MockStorage) query(ctx context.Context, query IndexQuery, callback func
 	}
 
 	result := mockReadBatch{}
-	for _, item := range items {
-		result.items = append(result.items, item)
-	}
+	result.items = append(result.items, items...)
 
 	callback(&result)
 	return nil
@@ -266,7 +279,7 @@ func (m *MockStorage) PutChunks(_ context.Context, chunks []Chunk) error {
 	defer m.mtx.Unlock()
 
 	for i := range chunks {
-		buf, err := chunks[i].Encode()
+		buf, err := chunks[i].Encoded()
 		if err != nil {
 			return err
 		}

@@ -14,12 +14,38 @@
     run: .zuul/playbooks/gophercloud-acceptance-test/run.yaml
 
 - job:
+    name: gophercloud-acceptance-test-ironic
+    parent: golang-test
+    description: |
+      Run gophercloud ironic acceptance test on master branch
+    run: .zuul/playbooks/gophercloud-acceptance-test-ironic/run.yaml
+
+- job:
+    name: gophercloud-acceptance-test-stein
+    parent: gophercloud-acceptance-test
+    description: |
+      Run gophercloud acceptance test on stein branch
+    vars:
+      global_env:
+        OS_BRANCH: stable/stein
+
+- job:
+    name: gophercloud-acceptance-test-rocky
+    parent: gophercloud-acceptance-test
+    description: |
+      Run gophercloud acceptance test on rocky branch
+    vars:
+      global_env:
+        OS_BRANCH: stable/rocky
+
+- job:
     name: gophercloud-acceptance-test-queens
     parent: gophercloud-acceptance-test
     description: |
       Run gophercloud acceptance test on queens branch
     vars:
-      os_branch: 'stable/queens'
+      global_env:
+        OS_BRANCH: stable/queens
 
 - job:
     name: gophercloud-acceptance-test-pike
@@ -27,14 +53,17 @@
     description: |
       Run gophercloud acceptance test on pike branch
     vars:
-      os_branch: 'stable/pike'
+      global_env:
+        OS_BRANCH: stable/pike
+
 - job:
     name: gophercloud-acceptance-test-ocata
     parent: gophercloud-acceptance-test
     description: |
       Run gophercloud acceptance test on ocata branch
     vars:
-      os_branch: 'stable/ocata'
+      global_env:
+        OS_BRANCH: stable/ocata
 
 - job:
     name: gophercloud-acceptance-test-newton
@@ -42,7 +71,8 @@
     description: |
       Run gophercloud acceptance test on newton branch
     vars:
-      os_branch: 'stable/newton'
+      global_env:
+        OS_BRANCH: stable/newton
 
 - job:
     name: gophercloud-acceptance-test-mitaka
@@ -50,7 +80,8 @@
     description: |
       Run gophercloud acceptance test on mitaka branch
     vars:
-      os_branch: 'stable/mitaka'
+      global_env:
+        OS_BRANCH: stable/mitaka
     nodeset: ubuntu-trusty
 
 - project:
@@ -59,6 +90,7 @@
       jobs:
         - gophercloud-unittest
         - gophercloud-acceptance-test
+        - gophercloud-acceptance-test-ironic
     recheck-mitaka:
       jobs:
         - gophercloud-acceptance-test-mitaka
@@ -74,3 +106,9 @@
     recheck-queens:
       jobs:
         - gophercloud-acceptance-test-queens
+    recheck-rocky:
+      jobs:
+        - gophercloud-acceptance-test-rocky
+    recheck-stein:
+      jobs:
+        - gophercloud-acceptance-test-stein

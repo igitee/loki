@@ -19,6 +19,8 @@ import (
 	"strconv"
 	"strings"
 
+	"github.com/pkg/errors"
+
 	"github.com/prometheus/prometheus/pkg/labels"
 	"github.com/prometheus/prometheus/storage"
 )
@@ -156,7 +158,7 @@ func (vec Vector) ContainsSameLabelset() bool {
 	return false
 }
 
-// Matrix is a slice of Seriess that implements sort.Interface and
+// Matrix is a slice of Series that implements sort.Interface and
 // has a String method.
 type Matrix []Series
 
@@ -215,7 +217,7 @@ func (r *Result) Vector() (Vector, error) {
 	}
 	v, ok := r.Value.(Vector)
 	if !ok {
-		return nil, fmt.Errorf("query result is not a Vector")
+		return nil, errors.New("query result is not a Vector")
 	}
 	return v, nil
 }
@@ -228,7 +230,7 @@ func (r *Result) Matrix() (Matrix, error) {
 	}
 	v, ok := r.Value.(Matrix)
 	if !ok {
-		return nil, fmt.Errorf("query result is not a range Vector")
+		return nil, errors.New("query result is not a range Vector")
 	}
 	return v, nil
 }
@@ -241,7 +243,7 @@ func (r *Result) Scalar() (Scalar, error) {
 	}
 	v, ok := r.Value.(Scalar)
 	if !ok {
-		return Scalar{}, fmt.Errorf("query result is not a Scalar")
+		return Scalar{}, errors.New("query result is not a Scalar")
 	}
 	return v, nil
 }
@@ -254,4 +256,66 @@ func (r *Result) String() string {
 		return ""
 	}
 	return r.Value.String()
+}
+
+// StorageSeries simulates promql.Series as storage.Series.
+type StorageSeries struct {
+	series Series
+}
+
+// NewStorageSeries returns a StorageSeries fromfor series.
+func NewStorageSeries(series Series) *StorageSeries {
+	return &StorageSeries{
+		series: series,
+	}
+}
+
+func (ss *StorageSeries) Labels() labels.Labels {
+	return ss.series.Metric
+}
+
+// Iterator returns a new iterator of the data of the series.
+func (ss *StorageSeries) Iterator() storage.SeriesIterator {
+	return newStorageSeriesIterator(ss.series)
+}
+
+type storageSeriesIterator struct {
+	points []Point
+	curr   int
+}
+
+func newStorageSeriesIterator(series Series) *storageSeriesIterator {
+	return &storageSeriesIterator{
+		points: series.Points,
+		curr:   -1,
+	}
+}
+
+func (ssi *storageSeriesIterator) Seek(t int64) bool {
+	i := ssi.curr
+	if i < 0 {
+		i = 0
+	}
+	for ; i < len(ssi.points); i++ {
+		if ssi.points[i].T >= t {
+			ssi.curr = i
+			return true
+		}
+	}
+	ssi.curr = len(ssi.points) - 1
+	return false
+}
+
+func (ssi *storageSeriesIterator) At() (t int64, v float64) {
+	p := ssi.points[ssi.curr]
+	return p.T, p.V
+}
+
+func (ssi *storageSeriesIterator) Next() bool {
+	ssi.curr++
+	return ssi.curr < len(ssi.points)
+}
+
+func (ssi *storageSeriesIterator) Err() error {
+	return nil
 }

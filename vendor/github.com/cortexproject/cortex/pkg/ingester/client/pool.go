@@ -30,8 +30,8 @@ type Factory func(addr string) (grpc_health_v1.HealthClient, error)
 
 // PoolConfig is config for creating a Pool.
 type PoolConfig struct {
-	ClientCleanupPeriod  time.Duration
-	HealthCheckIngesters bool
+	ClientCleanupPeriod  time.Duration `yaml:"client_cleanup_period,omitempty"`
+	HealthCheckIngesters bool          `yaml:"health_check_ingesters,omitempty"`
 	RemoteTimeout        time.Duration
 }
 
@@ -184,7 +184,7 @@ func (p *Pool) removeStaleClients() {
 	}
 }
 
-// cleanUnhealthy loops through all ingesters and deletes any that fails a healtcheck.
+// cleanUnhealthy loops through all ingesters and deletes any that fails a healthcheck.
 func (p *Pool) cleanUnhealthy() {
 	for _, addr := range p.RegisteredAddresses() {
 		client, ok := p.fromCache(addr)
@@ -192,7 +192,7 @@ func (p *Pool) cleanUnhealthy() {
 		if ok {
 			err := healthCheck(client, p.cfg.RemoteTimeout)
 			if err != nil {
-				level.Warn(util.Logger).Log("msg", "removing ingester failing healtcheck", "addr", addr, "reason", err)
+				level.Warn(util.Logger).Log("msg", "removing ingester failing healthcheck", "addr", addr, "reason", err)
 				p.RemoveClientFor(addr)
 			}
 		}

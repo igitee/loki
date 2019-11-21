@@ -1,192 +1,97 @@
 <p align="center"><img src="docs/logo_and_name.png" alt="Loki Logo"></p>
 
+<a href="https://cloud.drone.io/grafana/loki"><img src="https://cloud.drone.io/api/badges/grafana/loki/status.svg" alt="Drone CI" /></a>
 <a href="https://circleci.com/gh/grafana/loki/tree/master"><img src="https://circleci.com/gh/grafana/loki.svg?style=shield&circle-token=618193e5787b2951c1ea3352ad5f254f4f52313d" alt="CircleCI" /></a>
 <a href="https://goreportcard.com/report/github.com/grafana/loki"><img src="https://goreportcard.com/badge/github.com/grafana/loki" alt="Go Report Card" /></a>
 <a href="http://slack.raintank.io/"><img src="https://img.shields.io/badge/join%20slack-%23loki-brightgreen.svg" alt="Slack" /></a>
 
 # Loki: like Prometheus, but for logs.
 
-Loki is a horizontally-scalable, highly-available, multi-tenant log aggregation system inspired by [Prometheus](https://prometheus.io/).  It is designed to be very cost effective and easy to operate, as it does not index the contents of the logs, but rather a set of labels for each log stream.
+Loki is a horizontally-scalable, highly-available, multi-tenant log aggregation system inspired by [Prometheus](https://prometheus.io/).
+It is designed to be very cost effective and easy to operate.
+It does not index the contents of the logs, but rather a set of labels for each log stream.
 
 Compared to other log aggregation systems, Loki:
 
 - does not do full text indexing on logs. By storing compressed, unstructured logs and only indexing metadata, Loki is simpler to operate and cheaper to run.
 - indexes and groups log streams using the same labels you’re already using with Prometheus, enabling you to seamlessly switch between metrics and logs using the same labels that you’re already using with Prometheus.
-- is an especially good fit for storing Kubernetes Pod logs; metadata such as Pod labels is automatically scraped and indexed.
-- has native support in Grafana (already in the nightly builds, will be included in Grafana 6.0).
+- is an especially good fit for storing [Kubernetes](https://kubernetes.io/) Pod logs. Metadata such as Pod labels is automatically scraped and indexed.
+- has native support in Grafana (needs Grafana v6.0).
 
-Loki consists of 3 components:
+A Loki-based logging stack consists of 3 components:
 
+- `promtail` is the agent, responsible for gathering logs and sending them to Loki.
 - `loki` is the main server, responsible for storing logs and processing queries.
-- `promtail` is the agent, responsible for gathering logs and sending them to loki.
-- [Grafana](https://github.com/grafana/grafana) for the UI.
+- [Grafana](https://github.com/grafana/grafana) for querying and displaying the logs.
+
+Loki is like Prometheus, but for logs: we prefer a multidimensional label-based approach to indexing, and want a single-binary, easy to operate system with no dependencies.
+Loki differs from Prometheus by focussing on logs instead of metrics, and delivering logs via push, instead of pull.
 
 ## Getting started
 
-Currently there are three ways to try out Loki: using our free hosted demo, running it locally with Docker or building from source.
+The [Installation docs](./docs/installation/README.md) have instructions on how
+to install Loki via Docker images, Helm charts, Jsonnet, or from source.
 
-### Free Hosted Demo
+You may also be interested in [installing
+Promtail](./docs/clients/promtail/installation.md) to send logs to Loki.
 
-Grafana is running a free, hosted demo cluster of Loki; instructions for getting access can be found at [grafana.com](https://grafana.com/loki).
+Once you have Promtail, Loki, and Grafana running, continue with our [Getting
+Started Guide](./docs/getting-started/README.md) to get up and running with
+querying logs.
 
-### Run Locally Using Docker
+### Documentation
 
-The Docker images for [Loki](https://hub.docker.com/r/grafana/loki/) and [Promtail](https://hub.docker.com/r/grafana/promtail/) are available on DockerHub.
+The documentation with a Table of Contents can be found in
+[`docs/`](./docs/README.md).
 
-To test locally using `docker run`:
+Some key documents to read:
 
-1. Create a Docker network that the Docker containers can share:
-    ```bash
-    docker network create loki
-    ```
+- [API documentation](./docs/api.md) for alternative ways of getting logs into Loki.
+- [Operations](./docs/operations) for important aspects of running Loki.
+- [Promtail](./docs/clients/promtail) is an agent which can tail your log files and push them to Loki.
+- [Pipelines](./docs/clients/promtail/pipelines.md) for detailed log processing pipeline documentation
+- [Docker Logging Driver](./docs/clients/docker-driver) is a docker plugin to send logs directly to Loki from Docker containers.
+- [LogCLI](./docs/getting-started/logcli.md) on how to query your logs without Grafana.
+- [Loki Canary](./docs/operations/loki-canary.md) for monitoring your Loki installation for missing logs.
+- [Troubleshooting](./docs/getting-started/troubleshooting.md) for help around frequent error messages.
+- [Loki in Grafana](./docs/getting-started/grafana.md) for how to set up a Loki datasource in Grafana and query your logs.
 
-2. Start the Loki server:
-    ```bash
-    docker run --name loki --network=loki -p 3100:3100 --volume "$PWD/docs:/etc/loki" grafana/loki:master -config.file=/etc/loki/loki-local-config.yaml
-    ```
+## Getting Help
 
-3. Then start the Promtail agent. The default config polls the contents of your `/var/log` directory.
-    ```bash
-    docker run --name promtail --network=loki --volume "$PWD/docs:/etc/promtail" --volume "/var/log:/var/log" grafana/promtail:master -config.file=/etc/promtail/promtail-docker-config.yaml
-    ```
+If you have any questions or feedback regarding Loki:
 
-4. If you also want to run Grafana in docker:
-    ```bash
-    docker run --name grafana --network=loki -p 3000:3000 -e "GF_EXPLORE_ENABLED=true" grafana/grafana:master
-    ```
+- Ask a question on the Loki Slack channel. To invite yourself to the Grafana Slack, visit [http://slack.raintank.io/](http://slack.raintank.io/) and join the #loki channel.
+- [File an issue](https://github.com/grafana/loki/issues/new) for bugs, issues and feature suggestions.
+- Send an email to [lokiproject@googlegroups.com](mailto:lokiproject@googlegroups.com), or use the [web interface](https://groups.google.com/forum/#!forum/lokiproject).
+- UI issues should be filed directly in [Grafana](https://github.com/grafana/grafana/issues/new).
 
-5. Follow the steps for configuring the datasource in Grafana in the section below and set the URL field to: `http://loki:3100`
-
-Another option is to use the docker-compose file in the docs directory:
-
-1. git clone this repo locally (or just copy the contents of the docker-compose file locally into a file named `docker-compose.yaml`)
-2. `cd loki/docs`
-3. `docker-compose up`
-
-If you have have an older cached version of the grafana/grafana:master container then start by doing either:
-
-```bash
-docker pull grafana/grafana:master
-```
-
-Or for docker-compose:
-
-```bash
-docker-compose pull
-```
-
-### Configuring the Loki Datasource in Grafana
-
-Grafana ships with built-in support for Loki in the [latest nightly builds](https://grafana.com/grafana/download). Loki support will be officially released in Grafana 6.0.
-
-1. Open the side menu by clicking the Grafana icon in the top header.
-2. In the side menu under the Dashboards link you should find a link named Data Sources.
-3. Click the `+ Add data source` button in the top header.
-4. Choose Loki from the list.
-5. The http URL field should be the address of your Loki server e.g. `http://localhost:3100` and `http://loki:3100` when running with docker and docker-compose.
-
-Read more about the Explore feature in the [Grafana docs](http://docs.grafana.org/features/explore) and on how to search and filter logs with Loki.
-
-### Searching with Labels and Distributed Grep
-
-A log query consists of two parts: **log stream selector**, and a **search expression**. For performance reasons you need to start by choosing a log stream by selecting a log label.
-
-The log stream selector will reduce the number of log streams to a manageable volume and then the regex search expression is used to do a distributed grep over those log streams.
-
-Searching can be done in the Explore section of Grafana (latest nightly builds) or via the `logcli` tool which is documented [here](https://github.com/grafana/loki/blob/master/docs/logcli.md).
-
-#### Log Stream Selector
-
-For the label part of the query expression, wrap it in curly braces `{}` and then use the key value syntax for selecting labels. Multiple label expressions are separated by a comma:
-
-`{app="mysql",name="mysql-backup"}`
-
-The following label matching operators are currently supported:
-
-- `=` exactly equal.
-- `!=` not equal.
-- `=~` regex-match.
-- `!~` do not regex-match.
-
-Examples:
-
-- `{name=~"mysql.+"}`
-- `{name!~"mysql.+"}`
-
-The [same rules that apply for Prometheus Label Selectors](https://prometheus.io/docs/prometheus/latest/querying/basics/#instant-vector-selectors) apply for Loki Log Stream Selectors.
-
-#### Regex Search Expression
-
-After writing the Log Stream Selector, you can filter the results further by writing a search expression. The search expression can be just text or a regex expression.
-
-Example queries:
-
-- `{job="mysql"} error`
-- `{name="kafka"} tsdb-ops.*io:2003`
-- `{instance=~"kafka-[23]",name="kafka"} kafka.server:type=ReplicaManager`
-
-### Build and Run Loki Locally
-
-Loki can be run in a single host, no-dependencies mode using the following commands.
-
-You need `go` v1.10+
-
-```bash
-$ go build ./cmd/loki
-$ ./loki -config.file=./docs/loki-local-config.yaml
-...
-```
-
-To run promtail, use the following commands:
-
-```bash
-$ go build ./cmd/promtail
-$ ./promtail -config.file=./docs/promtail-local-config.yaml
-...
-```
-
-Grafana is Loki's UI, so you'll also want to run one of those:
-
-```bash
-$ docker run -ti -p 3000:3000 -e "GF_EXPLORE_ENABLED=true" grafana/grafana:master
-```
-
-In the Grafana UI (http://localhost:3000), log in with "admin"/"admin", add a new "Grafana Loki" datasource for `http://host.docker.internal:3100`, then go to explore and enjoy!
-
-## Grafana Provisioning
-
-It is possible to configure Grafana datasources using config files with Grafana’s provisioning system. You can read more about how it works in the [Grafana documentation](http://docs.grafana.org/administration/provisioning/#datasources).
-
-Here is a simple example of the provisioning yaml config for the Grafana Loki datasource:
-
-```yaml
-apiVersion: 1
-
-datasources:
-  - name: Loki
-    type: loki
-    access: proxy
-    url: http://localhost:3100
-    editable: false
-```
-
-Example with basic auth:
-
-```yaml
-apiVersion: 1
-
-datasources:
-  - name: Loki
-    type: loki
-    access: proxy
-    url: http://localhost:3100
-    editable: false
-    basicAuth: true
-    basicAuthUser: my_user
-    basicAuthPassword: test_password
-```
+Your feedback is always welcome.
 
 ## Further Reading
 
 - The original [design doc](https://docs.google.com/document/d/11tjK_lvp1-SVsFZjgOTr1vV3-q6vBAsZYIQ5ZeYBkyM/view) for Loki is a good source for discussion of the motivation and design decisions.
-- David Kaltschmidt KubeCon 2018 talk "[On the OSS Path to Full Observability with Grafana](https://kccna18.sched.com/event/GrXC/on-the-oss-path-to-full-observability-with-grafana-david-kaltschmidt-grafana-labs)"
+- Callum Styan's March 2019 DevOpsDays Vancouver talk "[Grafana Loki: Log Aggregation for Incident Investigations][devopsdays19-talk]".
+- Grafana Labs blog post "[How We Designed Loki to Work Easily Both as Microservices and as Monoliths][architecture-blog]".
+- Julien Garcia Gonzalez' March 2019 blog post "[Grafana Logging using Loki][giant-swarm-blog]".
+- Tom Wilkie's early-2019 CNCF Paris/FOSDEM talk "[Grafana Loki: like Prometheus, but for logs][fosdem19-talk]" ([slides][fosdem19-slides], [video][fosdem19-video]).
+- David Kaltschmidt's KubeCon 2018 talk "[On the OSS Path to Full Observability with Grafana][kccna18-event]" ([slides][kccna18-slides], [video][kccna18-video]) on how Loki fits into a cloud-native environment.
+- Goutham Veeramachaneni's blog post "[Loki: Prometheus-inspired, open source logging for cloud natives](https://grafana.com/blog/2018/12/12/loki-prometheus-inspired-open-source-logging-for-cloud-natives/)" on details of the Loki architecture.
+- David Kaltschmidt's blog post "[Closer look at Grafana's user interface for Loki](https://grafana.com/blog/2019/01/02/closer-look-at-grafanas-user-interface-for-loki/)" on the ideas that went into the logging user interface.
+
+[devopsdays19-talk]: https://grafana.com/blog/2019/05/06/how-loki-correlates-metrics-and-logs-and-saves-you-money/
+[architecture-blog]: https://grafana.com/blog/2019/04/15/how-we-designed-loki-to-work-easily-both-as-microservices-and-as-monoliths/
+[giant-swarm-blog]: https://blog.giantswarm.io/grafana-logging-using-loki
+[fosdem19-talk]: https://fosdem.org/2019/schedule/event/loki_prometheus_for_logs/
+[fosdem19-slides]: https://speakerdeck.com/grafana/grafana-loki-like-prometheus-but-for-logs
+[fosdem19-video]: https://mirror.as35701.net/video.fosdem.org/2019/UB2.252A/loki_prometheus_for_logs.mp4
+[kccna18-event]: https://kccna18.sched.com/event/GrXC/on-the-oss-path-to-full-observability-with-grafana-david-kaltschmidt-grafana-labs
+[kccna18-slides]: https://speakerdeck.com/davkal/on-the-path-to-full-observability-with-oss-and-launch-of-loki
+[kccna18-video]: https://www.youtube.com/watch?v=U7C5SpRtK74&list=PLj6h78yzYM2PZf9eA7bhWnIh_mK1vyOfU&index=346
+
+## Contributing
+
+Refer to [CONTRIBUTING.md](CONTRIBUTING.md)
+
+## License
+
+Apache License 2.0, see [LICENSE](LICENSE).
